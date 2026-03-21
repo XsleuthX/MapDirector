@@ -5,6 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>MapDirector — Cinematic Map Studio</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600;700&family=Bebas+Neue&display=swap" rel="stylesheet">
+<link href="https://cesium.com/downloads/cesiumjs/releases/1.127/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+<script src="https://cesium.com/downloads/cesiumjs/releases/1.127/Build/Cesium/Cesium.js"></script>
+<style>
+  .cesium-viewer-animationContainer,.cesium-viewer-timelineContainer,.cesium-viewer-toolbar,.cesium-viewer-bottom{display:none!important;}
+  .md-google3d-badge{position:absolute;left:12px;bottom:10px;z-index:12;padding:4px 8px;border-radius:999px;background:rgba(0,0,0,.62);border:1px solid rgba(255,255,255,.12);color:#fff;font:600 11px/1.2 'DM Sans',system-ui,sans-serif;pointer-events:none;}
+</style>
 <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -89,13 +95,334 @@ html[data-theme='light'] select{color-scheme:light}
 </head>
 <body>
 <div id="root"></div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.183.0/build/three.module.js",
+    "three/examples/jsm/": "https://cdn.jsdelivr.net/npm/three@0.183.0/examples/jsm/",
+    "3d-tiles-renderer": "https://cdn.jsdelivr.net/npm/3d-tiles-renderer@0.4.21/build/index.three.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { TilesRenderer } from '3d-tiles-renderer';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
+import { KTX2Loader } from 'three/examples/jsm/loaders/KTX2Loader.js';
+
+(function(){
+  const DEFAULT_LAYER_ID='md-3dtiles-layer';
+
+  function ecefToLngLatAlt(x,y,z){
+  function degToRad(v){ return (v*Math.PI)/180; }
+  function greatCircleKm(aLng,aLat,bLng,bLat){
+    const R=6371;
+    const dLat=degToRad(bLat-aLat);
+    const dLng=degToRad(bLng-aLng);
+    const s1=Math.sin(dLat/2), s2=Math.sin(dLng/2);
+    const q=s1*s1 + Math.cos(degToRad(aLat))*Math.cos(degToRad(bLat))*s2*s2;
+    return 2*R*Math.asin(Math.min(1, Math.sqrt(Math.max(0,q))));
+  }
+
+    const a=6378137.0;
+    const e2=6.69437999014e-3;
+    const b=a*Math.sqrt(1-e2);
+    const ep2=(a*a-b*b)/(b*b);
+    const p=Math.sqrt(x*x+y*y);
+    const th=Math.atan2(a*z,b*p);
+    const lon=Math.atan2(y,x);
+    const lat=Math.atan2(z+ep2*b*Math.pow(Math.sin(th),3), p-e2*a*Math.pow(Math.cos(th),3));
+    const n=a/Math.sqrt(1-e2*Math.sin(lat)*Math.sin(lat));
+    const alt=p/Math.cos(lat)-n;
+    return { lng:(lon*180)/Math.PI, lat:(lat*180)/Math.PI, alt };
+  }
+
+  window.MapDirector3DTiles = {
+    createController(map, getOptions){
+      let camera=null, scene=null, renderer=null, tiles=null, localTransform=null, mapInstance=null;
+      let currentKey='';
+      let disposed=false;
+      let lastError='';
+      let moveSyncTimer=0;
+      const layerId=DEFAULT_LAYER_ID;
+      const mapListeners=[];
+
+      function mercatorEnabled(){
+        try{
+          const p=map.getProjection && map.getProjection();
+          if(!p) return true;
+          return (typeof p === 'string' ? p : p.name || p.type) !== 'globe';
+        }catch(_){ return true; }
+      }
+
+      function emitStatus(status, extra={}){
+        window.dispatchEvent(new CustomEvent('md:3dtiles-status', { detail:{ status, error:lastError, ...extra } }));
+      }
+
+      function firstLabelLayerId(){
+        try{
+          const style=map.getStyle && map.getStyle();
+          const layers=(style && style.layers) || [];
+          const found=layers.find(l=>l && l.type==='symbol');
+          return found ? found.id : undefined;
+        }catch(_){ return undefined; }
+      }
+
+      function cleanupTiles(){
+        if(tiles){
+          try{ tiles.dispose(); }catch(_){ }
+          try{ if(scene && tiles.group && tiles.group.parent===scene) scene.remove(tiles.group); }catch(_){ }
+        }
+        tiles=null;
+        localTransform=null;
+      }
+
+      function removeLayer(){
+        cleanupTiles();
+        try{ if(map.getLayer(layerId)) map.removeLayer(layerId); }catch(_){ }
+      }
+
+      function destroy(){
+        disposed=true;
+        if(moveSyncTimer){ clearTimeout(moveSyncTimer); moveSyncTimer=0; }
+        mapListeners.forEach(([ev,fn])=>{ try{ map.off(ev, fn); }catch(_){ } });
+        mapListeners.length=0;
+        removeLayer();
+        camera=null; scene=null; renderer=null; mapInstance=null;
+        emitStatus('destroyed');
+      }
+
+      function updateLocalTransform(modelOrigin=[0,0,0], rotate=[Math.PI/2,0,0]){
+        const mc=maplibregl.MercatorCoordinate.fromLngLat([modelOrigin[0], modelOrigin[1]], modelOrigin[2]);
+        const axisX=new THREE.Vector3(1,0,0);
+        const axisY=new THREE.Vector3(0,1,0);
+        const axisZ=new THREE.Vector3(0,0,1);
+        const rotationX=new THREE.Matrix4().makeRotationAxis(axisX, rotate[0]);
+        const rotationY=new THREE.Matrix4().makeRotationAxis(axisY, rotate[1]);
+        const rotationZ=new THREE.Matrix4().makeRotationAxis(axisZ, rotate[2]);
+        const scale=mc.meterInMercatorCoordinateUnits();
+        localTransform=new THREE.Matrix4()
+          .makeTranslation(mc.x, mc.y, mc.z)
+          .scale(new THREE.Vector3(scale, -scale, scale))
+          .multiply(rotationX)
+          .multiply(rotationY)
+          .multiply(rotationZ);
+      }
+
+      function getEffectiveOpts(){
+        return ((typeof getOptions==='function' ? getOptions() : {}) || {});
+      }
+
+      function applyIonAuth(tilesInstance, rootUrl, authToken){
+        if(!tilesInstance) return;
+        const base=new URL(rootUrl, window.location.href);
+        const decorate=(uri)=>{
+          const next=new URL(uri, base);
+          for(const [k,v] of base.searchParams.entries()) if(!next.searchParams.has(k)) next.searchParams.set(k, v);
+          return next.toString();
+        };
+        tilesInstance.fetchOptions = tilesInstance.fetchOptions || {};
+        tilesInstance.fetchOptions.headers = { ...(tilesInstance.fetchOptions.headers||{}) };
+        if(authToken) tilesInstance.fetchOptions.headers.Authorization = `Bearer ${authToken}`;
+        tilesInstance.preprocessURL = decorate;
+        tilesInstance.onPreprocessURL = decorate;
+      }
+
+      function initTiles(url, altOffset=0, focusOpts={}, ionAssetId='', ionTileToken=''){
+        cleanupTiles();
+        const gltfLoader=new GLTFLoader();
+        const dracoLoader=new DRACOLoader();
+        dracoLoader.setDecoderPath('https://unpkg.com/three@0.183.0/examples/jsm/libs/draco/');
+        gltfLoader.setDRACOLoader(dracoLoader);
+        const ktx2Loader=new KTX2Loader();
+        ktx2Loader.setTranscoderPath('https://unpkg.com/three@0.183.0/examples/jsm/libs/basis/');
+        ktx2Loader.detectSupport(renderer);
+        gltfLoader.setKTX2Loader(ktx2Loader);
+
+        tiles=new TilesRenderer(url);
+        applyIonAuth(tiles, url, ionTileToken);
+        tiles.group.name='md-3dtiles-group';
+        tiles.manager.addHandler(/\.(gltf|glb)$/i, gltfLoader);
+        tiles.errorTarget=4;
+        tiles.lruCache.maxSize=12000;
+        tiles.lruCache.maxBytesSize=4 * 2 ** 30;
+        tiles.setCamera(camera);
+        tiles.setResolutionFromRenderer(camera, renderer);
+        scene.add(tiles.group);
+
+        const mapCenter=map.getCenter ? map.getCenter() : { lng:0, lat:0 };
+        updateLocalTransform([mapCenter.lng || 0, mapCenter.lat || 0, Number.isFinite(+altOffset)?+altOffset:0]);
+
+        let handled=false;
+        const onLoadTileset=()=>{
+          if(handled || !tiles) return;
+          handled=true;
+          try{
+            let located=null;
+            try{
+              const sphere=new THREE.Sphere();
+              tiles.getBoundingSphere(sphere);
+              const center=sphere.center.clone();
+              const { lng, lat, alt } = ecefToLngLatAlt(center.x, center.y, center.z);
+              if(Number.isFinite(lng) && Number.isFinite(lat)) located={ lng, lat, alt, radius:Math.max(0, sphere.radius || 0) };
+            }catch(_){ }
+            if(located && Number.isFinite(located.lng) && Number.isFinite(located.lat) && Math.abs(located.lat) <= 90){
+              const finalAlt=(located.alt || 0) + (Number.isFinite(+altOffset)?+altOffset:0);
+              updateLocalTransform([located.lng, located.lat, finalAlt]);
+              if(focusOpts && focusOpts.autoFocus !== false && Math.abs(located.lat) < 89.9){
+                const z = Number.isFinite(+focusOpts.zoom) ? +focusOpts.zoom : Math.max(map.getZoom ? map.getZoom() : 0, 15.5);
+                const p = Number.isFinite(+focusOpts.pitch) ? +focusOpts.pitch : Math.max(map.getPitch ? map.getPitch() : 0, 55);
+                const b = Number.isFinite(+focusOpts.bearing) ? +focusOpts.bearing : (map.getBearing ? map.getBearing() : 0);
+                try{ map.jumpTo({ center:[located.lng, located.lat], zoom:z, pitch:p, bearing:b }); }catch(_){ }
+              }
+              emitStatus('located', { url, ionAssetId, lng:located.lng, lat:located.lat, alt:finalAlt, radius:located.radius });
+            } else {
+              emitStatus('ready', { url, ionAssetId, global:true });
+            }
+            map.triggerRepaint();
+          }catch(err){
+            lastError=err?.message || String(err);
+            emitStatus('error', { url, ionAssetId });
+            console.warn('3D tiles transform failed', err);
+          }
+        };
+        tiles.addEventListener('load-tileset', onLoadTileset);
+      }
+
+      function buildLayer(url, altOffset, focusOpts, ionAssetId, ionTileToken){
+        return {
+          id: layerId,
+          type: 'custom',
+          renderingMode: '3d',
+          onAdd(mapArg, gl){
+            mapInstance=mapArg;
+            camera=new THREE.PerspectiveCamera();
+            scene=new THREE.Scene();
+            scene.add(new THREE.AmbientLight(0xffffff, 3));
+            renderer=new THREE.WebGLRenderer({ canvas:mapArg.getCanvas(), context:gl, antialias:true });
+            renderer.autoClear=false;
+            lastError='';
+            emitStatus('loading', { url, ionAssetId });
+            initTiles(url, altOffset, focusOpts, ionAssetId, ionTileToken);
+          },
+          render(_gl, args){
+            if(disposed || !camera || !renderer || !scene || !localTransform) return;
+            try{
+              camera.projectionMatrix.fromArray(args.defaultProjectionData.mainMatrix);
+              camera.projectionMatrix.multiply(localTransform);
+              if(tiles){
+                tiles.setCamera(camera);
+                tiles.setResolutionFromRenderer(camera, renderer);
+                tiles.update();
+              }
+              renderer.resetState();
+              renderer.render(scene, camera);
+              mapInstance && mapInstance.triggerRepaint();
+            }catch(err){
+              lastError=err?.message || String(err);
+              emitStatus('error', { url, ionAssetId });
+              console.warn('3D tiles render failed', err);
+            }
+          },
+          onRemove(){ cleanupTiles(); }
+        };
+      }
+
+      function sync(){
+        if(disposed) return;
+        const opts=getEffectiveOpts();
+        const enabled=!!opts.enabled;
+        const url=(opts.url || '').trim();
+        const ionAssetId=String(opts.ionAssetId || '');
+        const ionTileToken=(opts.ionTileAccessToken || '').trim();
+        const altOffset=Number.isFinite(+opts.altOffset) ? +opts.altOffset : 0;
+        const focusOpts={
+          autoFocus: opts.autoFocus !== false,
+          zoom: Number.isFinite(+opts.focusZoom) ? +opts.focusZoom : undefined,
+          pitch: Number.isFinite(+opts.focusPitch) ? +opts.focusPitch : undefined,
+          bearing: Number.isFinite(+opts.focusBearing) ? +opts.focusBearing : undefined,
+        };
+
+        if(!mercatorEnabled()){
+          removeLayer();
+          currentKey='__blocked_globe__';
+          emitStatus('blocked-globe', { ionAssetId });
+          return;
+        }
+
+        if(!enabled || !url){
+          removeLayer();
+          currentKey='';
+          emitStatus(enabled ? 'missing-url' : 'idle', { ionAssetId });
+          return;
+        }
+
+        const nextKey=JSON.stringify({ url, altOffset, focusOpts, ionAssetId, token:!!ionTileToken });
+        if(currentKey===nextKey && map.getLayer(layerId)) return;
+
+        removeLayer();
+        const beforeId=firstLabelLayerId();
+        try{
+          map.addLayer(buildLayer(url, altOffset, focusOpts, ionAssetId, ionTileToken), beforeId);
+          currentKey=nextKey;
+        }catch(err){
+          lastError=err?.message || String(err);
+          emitStatus('error', { ionAssetId });
+          console.warn('Failed to add 3D tiles layer', err);
+        }
+      }
+
+      function scheduleSync(delay=60){
+        if(moveSyncTimer) clearTimeout(moveSyncTimer);
+        moveSyncTimer=setTimeout(()=>{ moveSyncTimer=0; sync(); }, delay);
+      }
+
+      function focusToLastView(view){
+        if(!view || !view.center || !Array.isArray(view.center)) return;
+        try{
+          map.jumpTo({
+            center:view.center,
+            zoom:Number.isFinite(+view.zoom) ? +view.zoom : (map.getZoom ? map.getZoom() : 16),
+            pitch:Number.isFinite(+view.pitch) ? +view.pitch : (map.getPitch ? map.getPitch() : 55),
+            bearing:Number.isFinite(+view.bearing) ? +view.bearing : (map.getBearing ? map.getBearing() : 0),
+          });
+        }catch(_){ }
+      }
+
+      ['moveend','zoomend','rotateend','pitchend','style.load'].forEach(ev=>{
+        const fn=()=>scheduleSync(ev==='style.load' ? 30 : 80);
+        mapListeners.push([ev,fn]);
+        try{ map.on(ev, fn); }catch(_){ }
+      });
+
+      return { sync, destroy, removeLayer, focusToLastView, scheduleSync };
+    }
+  };
+})();
+</script>
+
 <script type="text/babel">
 const {useState,useEffect,useRef,useCallback,useReducer,useMemo}=React;
+
+async function resolveCesiumIonAssetEndpoint(token, assetId){
+  const res=await fetch(`https://api.cesium.com/v1/assets/${assetId}/endpoint`, { headers:{ Authorization:`Bearer ${token}` } });
+  if(!res.ok) throw new Error(`Cesium ion endpoint ${res.status}`);
+  const json=await res.json();
+  const url=((json&&json.url)||(json&&json.options&&json.options.url)||'').trim();
+  const accessToken=((json&&json.accessToken)||'').trim();
+  if(!url) throw new Error('Endpoint returned no tileset url');
+  return { url, accessToken, raw:json };
+}
 
 // ═══════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════
 const BASEMAPS=[
+  {id:'osm-raster',label:'OpenStreetMap Raster',swatch:'#d8d3c7',cat:'Raster',
+   isRaster:true,
+   rasterStyle:{version:8,sources:{'osm-raster':{type:'raster',tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,maxzoom:19,attribution:'© OpenStreetMap contributors'}},layers:[{id:'osm-raster-layer',type:'raster',source:'osm-raster'}]},
+   note:'CORS-safe fallback'},
   {id:'dark-matter',label:'Dark Matter',swatch:'#111118',cat:'Vector',
    url:'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
    noLabUrl:'https://basemaps.cartocdn.com/gl/dark-matter-nolabels-gl-style/style.json'},
@@ -112,8 +439,8 @@ const BASEMAPS=[
    url:'https://tiles.openfreemap.org/styles/bright',
    noLabUrl:'https://tiles.openfreemap.org/styles/bright'},
   {id:'mapbox-custom',label:'Mapbox Custom',swatch:'#1a2a3a',cat:'Mapbox',
-   url:'https://api.mapbox.com/styles/v1/xsleuthx/ckp3d9a5r79ul18k83vsv4vnk/wmts?access_token=API Key',
-   noLabUrl:'https://api.mapbox.com/styles/v1/xsleuthx/ckp3d9a5r79ul18k83vsv4vnk/wmts?access_token=API Key',
+   url:'https://api.mapbox.com/styles/v1/xsleuthx/ckp3d9a5r79ul18k83vsv4vnk/wmts?access_token=',
+   noLabUrl:'https://api.mapbox.com/styles/v1/xsleuthx/ckp3d9a5r79ul18k83vsv4vnk/wmts?access_token=',
    isRaster:false, isWMTS:true},
   // Raster satellite tiles using simple inline style with raster source
   {id:'bing-sat',label:'Bing Satellite',swatch:'#0a2a0a',cat:'Satellite',
@@ -160,6 +487,18 @@ const BASEMAPS=[
    isRaster:true,
    rasterStyle:{version:8,sources:{'esri-natgeo':{type:'raster',tiles:['https://server.arcgisonline.com/ArcGIS/rest/services/NatGeo_World_Map/MapServer/tile/{z}/{y}/{x}'],tileSize:256,maxzoom:16,attribution:'Esri / National Geographic'}},layers:[{id:'esri-natgeo-layer',type:'raster',source:'esri-natgeo'}]},
    note:'Legacy'},
+  {id:'light-pollution',label:'Earth at Night · Esri Firefly',swatch:'#ff9d2e',cat:'Science',
+   isRaster:true,
+   rasterStyle:{version:8,sources:{'light-pollution':{type:'raster',tiles:['https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{z}/{y}/{x}'],tileSize:256,maxzoom:19,attribution:'Esri · World Imagery (Firefly)'}},layers:[{id:'light-pollution-layer',type:'raster',source:'light-pollution',paint:{'raster-opacity':0.96,'raster-fade-duration':0}}]},
+   note:'Muted night-style Earth imagery'},
+  {id:'moon-hillshaded-albedo',label:'Moon Hillshaded Albedo',swatch:'#c9ced8',cat:'OpenPlanetary',
+   isRaster:true,
+   rasterStyle:{version:8,sources:{'moon-hillshaded-albedo':{type:'raster',tiles:['https://cartocdn-gusc.global.ssl.fastly.net/opmbuilder/api/v1/map/named/opm-moon-basemap-v0-1/all/{z}/{x}/{y}.png'],tileSize:256,maxzoom:9,attribution:'OpenPlanetaryMap · Moon Hillshaded Albedo'}},layers:[{id:'moon-hillshaded-albedo-layer',type:'raster',source:'moon-hillshaded-albedo'}]},
+   note:'Moon'},
+  {id:'mars-viking-mdim21',label:'Mars Basemap v0.2',swatch:'#b97d5b',cat:'OpenPlanetary',
+   isRaster:true,
+   rasterStyle:{version:8,sources:{'mars-viking-mdim21':{type:'raster',tiles:['https://cartocdn-gusc.global.ssl.fastly.net/opmbuilder/api/v1/map/named/opm-mars-basemap-v0-2/all/{z}/{x}/{y}.png'],tileSize:256,maxzoom:9,attribution:'OpenPlanetaryMap · Mars Basemap v0.2'}},layers:[{id:'mars-viking-mdim21-layer',type:'raster',source:'mars-viking-mdim21',paint:{'raster-opacity':1,'raster-fade-duration':0}}]},
+   note:'Mars'},
 ];
 const EASINGS={linear:t=>t,easeInCubic:t=>t*t*t,easeOutCubic:t=>1-Math.pow(1-t,3),easeInOutCubic:t=>t<.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2,easeOutExpo:t=>t===1?1:1-Math.pow(2,-10*t),easeInOutSine:t=>-(Math.cos(Math.PI*t)-1)/2};
 const ENAMES={linear:'Linear',easeInCubic:'Ease In',easeOutCubic:'Ease Out',easeInOutCubic:'In-Out Cubic',easeOutExpo:'Ease Out Expo',easeInOutSine:'In-Out Sine'};
@@ -241,16 +580,14 @@ const OVERLAY_SOURCES=[
   {id:'volcanoes-global',label:'Volcanoes · Worldwide',cat:'Hazards',kind:'point',loader:'volcanoes',source:'Global volcano dataset',style:{fill:'#ff5a36',line:'#ff5a36',lw:1,fillOp:.88,cr:4}},
   {id:'airports-global',label:'Global Airports · Medium & Large',cat:'Aviation',kind:'point',loader:'airports',source:'OurAirports',style:{fill:'#75d0ff',line:'#75d0ff',lw:1,fillOp:.88,cr:4,pointMode:'icon',iconKind:'airport',iconSize:18}},
   {id:'us-dod-installations',label:'U.S. Military Installations',cat:'Security',kind:'mixed',loader:'usDodInstallations',source:'U.S. DoD / USDOT NTAD public service',style:{fill:'#c090ff',line:'#c090ff',lw:1.4,fillOp:.12,cr:4}},
-  {id:'mil-bases-view',label:'Military Bases · Current View (OSM)',cat:'Security',kind:'mixed',loader:'milBase',source:'OSM / Overpass',style:{fill:'#c090ff',line:'#c090ff',lw:1.4,fillOp:.12,cr:4}},
   {id:'sub-cables-global',label:'Sub Cables · Global',cat:'Infrastructure',kind:'mixed',loader:'subcablesGlobal',source:'Submarine Cable Map dataset',style:{fill:'#4dc5ff',line:'#4dc5ff',lw:1.6,fillOp:.08,cr:3}},
   {id:'reactors-global',label:'Reactors · Global',cat:'Energy',kind:'point',loader:'reactors',source:'IAEA PRIS / GeoNuclearData',style:{fill:'#c8ff52',line:'#c8ff52',lw:1,fillOp:.85,cr:4,pointMode:'icon',iconKind:'reactor',iconSize:18}},
   {id:'ports-global',label:'Global Ports',cat:'Maritime',kind:'point',loader:'ports',source:'Global ports dataset',style:{fill:'#6bd3ff',line:'#6bd3ff',lw:1,fillOp:.8,cr:4,pointMode:'icon',iconKind:'port',iconSize:18}},
   {id:'ports-us',label:'U.S. Ports · Public Reference',cat:'Maritime',kind:'point',loader:'portsUS',source:'Global ports dataset · U.S. filtered',style:{fill:'#6bd3ff',line:'#6bd3ff',lw:1,fillOp:.82,cr:4,pointMode:'icon',iconKind:'port',iconSize:18}},
   {id:'flights-global',label:'Global Flights · Live',cat:'Aviation',kind:'point',loader:'flights',source:'OpenSky',style:{fill:'#ffb347',line:'#ffb347',lw:1,fillOp:.9,cr:3,pointMode:'icon',iconKind:'flight',iconSize:18}},
   {id:'piracy-hotspots',label:'Piracy Hotspots',cat:'Maritime',kind:'point',loader:'piracy',source:'Global maritime pirate attacks dataset',style:{fill:'#ff6b6b',line:'#ff6b6b',lw:1,fillOp:.85,cr:4,pointMode:'icon',iconKind:'piracy',iconSize:18}},
-  {id:'mil-airfields-view',label:'Military Airfields · Current View',cat:'Security',kind:'mixed',loader:'milAir',source:'OSM / Overpass',style:{fill:'#c090ff',line:'#c090ff',lw:1.4,fillOp:.12,cr:4}},
-  {id:'naval-forces-view',label:'Naval Bases & Ports · Current View (OSM)',cat:'Security',kind:'mixed',loader:'naval',source:'OSM / Overpass',style:{fill:'#7cc7ff',line:'#7cc7ff',lw:1.4,fillOp:.12,cr:4}},
   {id:'us-carrier-homeports',label:'U.S. Aircraft Carriers · Homeport Reference',cat:'Security',kind:'point',loader:'carrierRef',source:'U.S. Navy public reference',style:{fill:'#ffd166',line:'#ffd166',lw:1,fillOp:.9,cr:4,pointMode:'icon',iconKind:'port',iconSize:18}},
+  {id:'shipping-routes-global',label:'Global Shipping Routes',cat:'Maritime',kind:'line',loader:'shippingRoutes',source:'newzealandpaul/Shipping-Lanes (GitHub)',style:{fill:'#00d4aa',line:'#00d4aa',lw:1.4,fillOp:0,cr:0}},
 ];
 
 function csvSplit(line){
@@ -275,10 +612,44 @@ function parseCSV(text){
 }
 const pickNum=(obj,keys)=>{for(const k of keys){const v=parseFloat(obj?.[k]);if(Number.isFinite(v))return v;}return null;};
 const pickStr=(obj,keys,fb='')=>{for(const k of keys){const v=obj?.[k];if(v!=null&&String(v).trim())return String(v);}return fb;};
+function extractLatLng(row,mapCfg={}){
+  const latKeys=mapCfg.latKeys||['latitude','lat','LATITUDE','Latitude','y'];
+  const lngKeys=mapCfg.lngKeys||['longitude','lon','lng','LONGITUDE','Longitude','x'];
+  let lat=pickNum(row,latKeys);
+  let lng=pickNum(row,lngKeys);
+  if(Number.isFinite(lat)&&Number.isFinite(lng)) return {lat,lng};
+  const nested=[row?.city_coords,row?.coords,row?.coordinates,row?.location,row?.geo,row?.position,row?.centroid];
+  for(const n of nested){
+    if(!n) continue;
+    if(Array.isArray(n) && n.length>=2){
+      const a=parseFloat(n[0]), b=parseFloat(n[1]);
+      if(Number.isFinite(a)&&Number.isFinite(b)){
+        if(Math.abs(a)<=90 && Math.abs(b)<=180) return {lat:a,lng:b};
+        if(Math.abs(a)<=180 && Math.abs(b)<=90) return {lat:b,lng:a};
+      }
+    }
+    if(typeof n==='string'){
+      const m=n.match(/(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)/);
+      if(m){
+        const a=parseFloat(m[1]), b=parseFloat(m[2]);
+        if(Number.isFinite(a)&&Number.isFinite(b)){
+          if(Math.abs(a)<=90 && Math.abs(b)<=180) return {lat:a,lng:b};
+          if(Math.abs(a)<=180 && Math.abs(b)<=90) return {lat:b,lng:a};
+        }
+      }
+    }
+    if(typeof n==='object'){
+      lat=pickNum(n,latKeys) ?? pickNum(n,['lat','latitude','y']);
+      lng=pickNum(n,lngKeys) ?? pickNum(n,['lng','lon','longitude','x']);
+      if(Number.isFinite(lat)&&Number.isFinite(lng)) return {lat,lng};
+    }
+  }
+  return {lat:null,lng:null};
+}
 function normalizeRowsToPoints(rows, mapCfg={}){
   const feats=(rows||[]).map((row,i)=>{
-    const lat=pickNum(row,mapCfg.latKeys||['latitude','lat','LATITUDE','Latitude','y']);
-    const lng=pickNum(row,mapCfg.lngKeys||['longitude','lon','lng','LONGITUDE','Longitude','x']);
+    const pos=extractLatLng(row,mapCfg);
+    const lat=pos.lat, lng=pos.lng;
     if(!Number.isFinite(lat)||!Number.isFinite(lng))return null;
     const props={};
     Object.keys(row||{}).slice(0,24).forEach(k=>props[k]=row[k]);
@@ -356,59 +727,189 @@ async function fetchPortsGlobal(){
   }));
   return normalizeRowsToPoints(rows,{latKeys:['latitude'],lngKeys:['longitude'],nameKeys:['name','city','code'],fallbackName:'Port',source:'Sea Ports'});
 }
+function toNum(v){ const n=parseFloat(v); return Number.isFinite(n)?n:null; }
+function metersToFeet(v){ return Number.isFinite(v)? v*3.28084 : null; }
+function msToKnots(v){ return Number.isFinite(v)? v*1.94384 : null; }
+function msToFpm(v){ return Number.isFinite(v)? v*196.850394 : null; }
+function decodeOpenSkyState(s,i=0){
+  const lng=toNum(s?.[5]), lat=toNum(s?.[6]);
+  if(!Number.isFinite(lat)||!Number.isFinite(lng)) return null;
+  const icao24=String(s?.[0]||'').trim().toLowerCase();
+  const callsign=String(s?.[1]||'').trim();
+  const origin_country=String(s?.[2]||'').trim();
+  const baro_altitude_m=toNum(s?.[7]);
+  const on_ground=!!s?.[8];
+  const velocity_mps=toNum(s?.[9]);
+  const heading=toNum(s?.[10]);
+  const vertical_rate_mps=toNum(s?.[11]);
+  const geo_altitude_m=toNum(s?.[13]);
+  const squawk=String(s?.[14]||'').trim();
+  const spi=!!s?.[15];
+  const position_source=s?.[16];
+  const category=s?.[17];
+  return {type:'Feature',geometry:{type:'Point',coordinates:[lng,lat]},properties:{
+    id:icao24||`flight-${i+1}`,
+    name:callsign||icao24||`Flight ${i+1}`,
+    callsign,icao24,origin:origin_country,origin_country,
+    velocity:velocity_mps,velocity_mps,velocity_kts:msToKnots(velocity_mps),
+    heading,true_track:heading,
+    baro_altitude:baro_altitude_m,baro_altitude_m,baro_altitude_ft:metersToFeet(baro_altitude_m),
+    geo_altitude_m,geo_altitude_ft:metersToFeet(geo_altitude_m),
+    vertical_rate_mps,vertical_rate_fpm:msToFpm(vertical_rate_mps),
+    on_ground,squawk,spi,position_source,category,
+    source:'OpenSky'
+  }};
+}
 async function fetchFlightsGlobal(){
-  const r=await fetch('https://opensky-network.org/api/states/all');
-  if(!r.ok) throw new Error('OpenSky request failed');
-  const data=await r.json();
-  const states=data?.states||[];
-  const feats=states.map((s,i)=>{
-    const lng=parseFloat(s[5]),lat=parseFloat(s[6]);
-    if(!Number.isFinite(lat)||!Number.isFinite(lng))return null;
-    return {type:'Feature',geometry:{type:'Point',coordinates:[lng,lat]},properties:{name:(s[1]||'').trim()||`Flight ${i+1}`,icao24:s[0]||'',origin:s[2]||'',velocity:s[9]||'',heading:s[10]||'',baro_altitude:s[7]||'',source:'OpenSky'}};
-  }).filter(Boolean);
-  return {type:'FeatureCollection',features:feats};
+  return fetchFlightsLive(null);
 }
-
-function boundsParamFromMap(map){
-  try{
-    const b=map?.getBounds?.();
-    if(!b)return null;
-    return {south:b.getSouth(),west:b.getWest(),north:b.getNorth(),east:b.getEast()};
-  }catch{return null;}
-}
-function featureCollectionOrEmpty(fc){return fc&&fc.type==='FeatureCollection'?fc:{type:'FeatureCollection',features:[]};}
 function normalizeLiveFlightsSnapshot(data){
   const states=data?.states||[];
-  const feats=states.map((s,i)=>{
-    const lng=parseFloat(s?.[5]),lat=parseFloat(s?.[6]);
-    if(!Number.isFinite(lat)||!Number.isFinite(lng))return null;
-    const heading=Number.isFinite(parseFloat(s?.[10]))?parseFloat(s[10]):0;
-    const velocity=Number.isFinite(parseFloat(s?.[9]))?parseFloat(s[9]):null;
-    const altitude=Number.isFinite(parseFloat(s?.[7]))?parseFloat(s[7]):null;
-    const icao24=String(s?.[0]||'').trim();
-    const callsign=String(s?.[1]||'').trim();
-    const origin=String(s?.[2]||'').trim();
-    return {type:'Feature',geometry:{type:'Point',coordinates:[lng,lat]},properties:{
-      id:icao24||`flight-${i+1}`,
-      name:callsign||icao24||`Flight ${i+1}`,
-      callsign,icao24,origin,
-      velocity,heading,baro_altitude:altitude,source:'OpenSky'
-    }};
-  }).filter(Boolean);
-  return {type:'FeatureCollection',features:feats};
+  return {type:'FeatureCollection',features:states.map((s,i)=>decodeOpenSkyState(s,i)).filter(Boolean)};
 }
-async function fetchFlightsLive(bounds){
-  const url=new URL('https://opensky-network.org/api/states/all');
-  if(bounds){
-    url.searchParams.set('lamin', String(bounds.south));
-    url.searchParams.set('lomin', String(bounds.west));
-    url.searchParams.set('lamax', String(bounds.north));
-    url.searchParams.set('lomax', String(bounds.east));
-  }
-  const r=await fetch(url.toString());
-  if(!r.ok) throw new Error(`OpenSky request failed (${r.status})`);
+const __airFetchState = { lastGood:{type:'FeatureCollection',features:[]}, remoteCooldownUntil:0, warnAt:0, localCooldownUntil:0, authFailedUntil:0 };
+const getAirEmptyFC=()=>({type:'FeatureCollection',features:[]});
+function normalizeFlightBounds(bounds){
+  if(!bounds) return null;
+  const clamp=(v,min,max)=>Math.max(min, Math.min(max, Number(v)));
+  let south=clamp(bounds.south,-85,85), north=clamp(bounds.north,-85,85);
+  let west=Number(bounds.west), east=Number(bounds.east);
+  if(!Number.isFinite(south)||!Number.isFinite(north)||!Number.isFinite(west)||!Number.isFinite(east)) return null;
+  if(north < south){ const t=north; north=south; south=t; }
+  const normLon=(lon)=>{ let x=((lon+180)%360+360)%360-180; if(x===-180) x=180; return x; };
+  west=normLon(west); east=normLon(east);
+  const span=((east - west + 360) % 360);
+  if(span === 0 || span > 170 || east < west) return null;
+  const latSpan=Math.abs(north-south);
+  if(latSpan > 55 || span > 80) return null;
+  return { south, west, north, east, span, latSpan };
+}
+async function fetchOpenSkyPublic(bounds){
+  const url=new URL(AIR_HTTP_PUBLIC);
+  url.searchParams.set('lamin', String(bounds.south));
+  url.searchParams.set('lomin', String(bounds.west));
+  url.searchParams.set('lamax', String(bounds.north));
+  url.searchParams.set('lomax', String(bounds.east));
+  url.searchParams.set('extended','1');
+  const r=await fetch(url.toString(), {cache:'no-store', mode:'cors'});
+  if(!r.ok) throw new Error(`OpenSky public ${r.status}`);
   return normalizeLiveFlightsSnapshot(await r.json());
 }
+async function fetchOpenSkyRelay(bounds){
+  const url=new URL(AIR_HTTP_LOCAL, window.location.href);
+  url.searchParams.set('lamin', String(bounds.south));
+  url.searchParams.set('lomin', String(bounds.west));
+  url.searchParams.set('lamax', String(bounds.north));
+  url.searchParams.set('lomax', String(bounds.east));
+  url.searchParams.set('extended','1');
+  const r=await fetch(url.toString(), {cache:'no-store'});
+  if(!r.ok) throw new Error(`OpenSky relay ${r.status}`);
+  return normalizeLiveFlightsSnapshot(await r.json());
+}
+async function fetchFlightsLive(bounds){
+  const safeBounds=normalizeFlightBounds(bounds);
+  if(!safeBounds) return __airFetchState.lastGood || getAirEmptyFC();
+  const now=Date.now();
+  const lastGood=()=>__airFetchState.lastGood || getAirEmptyFC();
+
+  if(now < __airFetchState.localCooldownUntil || now < __airFetchState.authFailedUntil){
+    return lastGood();
+  }
+  try{
+    const fc=await fetchOpenSkyRelay(safeBounds);
+    if(fc?.features?.length){
+      __airFetchState.lastGood=fc;
+      return fc;
+    }
+  }catch(err){
+    const msg=String(err && err.message || err || '');
+    if(/401\b/.test(msg)){
+      __airFetchState.authFailedUntil=Date.now()+30*60*1000;
+    }else if(/\b(429|502|503|504)\b/.test(msg)){
+      __airFetchState.localCooldownUntil=Date.now()+5*60*1000;
+    }else{
+      __airFetchState.localCooldownUntil=Date.now()+2*60*1000;
+    }
+    if(Date.now() > __airFetchState.warnAt){
+      console.warn(`OpenSky relay unavailable; falling back to public/ADSB path. ${msg}`);
+      __airFetchState.warnAt=Date.now()+15000;
+    }
+  }
+
+  if(now >= __airFetchState.remoteCooldownUntil){
+    try{
+      const fc=await fetchOpenSkyPublic(safeBounds);
+      if(fc?.features?.length){
+        __airFetchState.lastGood=fc;
+        return fc;
+      }
+    }catch(err){
+      const msg=String(err && err.message || err || '');
+      if(/\b(401|403|429|5\d\d)\b/.test(msg)) __airFetchState.remoteCooldownUntil=Date.now()+5*60*1000;
+      if(Date.now() > __airFetchState.warnAt){
+        console.warn(`OpenSky public path unavailable; reusing cached flight snapshot. ${msg}`);
+        __airFetchState.warnAt=Date.now()+15000;
+      }
+    }
+  }
+  return lastGood();
+}
+
+const BUILTIN_DATA_CENTER_REFERENCE=[
+  {name:'AWS us-east-1',provider:'AWS',lat:38.9941,lng:-77.4524,country:'US',region:'Virginia'},
+  {name:'AWS us-east-2',provider:'AWS',lat:40.0946,lng:-82.7541,country:'US',region:'Ohio'},
+  {name:'AWS us-west-1',provider:'AWS',lat:37.4437,lng:-122.1537,country:'US',region:'California'},
+  {name:'AWS us-west-2',provider:'AWS',lat:45.8399,lng:-119.7006,country:'US',region:'Oregon'},
+  {name:'AWS ca-central-1',provider:'AWS',lat:45.5017,lng:-73.5673,country:'CA',region:'Montreal'},
+  {name:'AWS eu-west-1',provider:'AWS',lat:53.3498,lng:-6.2603,country:'IE',region:'Dublin'},
+  {name:'AWS eu-west-2',provider:'AWS',lat:51.5074,lng:-0.1278,country:'GB',region:'London'},
+  {name:'AWS eu-central-1',provider:'AWS',lat:50.1109,lng:8.6821,country:'DE',region:'Frankfurt'},
+  {name:'AWS eu-south-1',provider:'AWS',lat:45.4642,lng:9.19,country:'IT',region:'Milan'},
+  {name:'AWS eu-north-1',provider:'AWS',lat:59.3293,lng:18.0686,country:'SE',region:'Stockholm'},
+  {name:'AWS ap-northeast-1',provider:'AWS',lat:35.6762,lng:139.6503,country:'JP',region:'Tokyo'},
+  {name:'AWS ap-northeast-2',provider:'AWS',lat:37.5665,lng:126.978,country:'KR',region:'Seoul'},
+  {name:'AWS ap-south-1',provider:'AWS',lat:19.076,lng:72.8777,country:'IN',region:'Mumbai'},
+  {name:'AWS ap-southeast-1',provider:'AWS',lat:1.3521,lng:103.8198,country:'SG',region:'Singapore'},
+  {name:'AWS ap-southeast-2',provider:'AWS',lat:-33.8688,lng:151.2093,country:'AU',region:'Sydney'},
+  {name:'AWS sa-east-1',provider:'AWS',lat:-23.5558,lng:-46.6396,country:'BR',region:'Sao Paulo'},
+  {name:'Azure East US',provider:'Azure',lat:37.3719,lng:-79.8164,country:'US',region:'Virginia'},
+  {name:'Azure East US 2',provider:'Azure',lat:36.6681,lng:-78.3889,country:'US',region:'Virginia'},
+  {name:'Azure Central US',provider:'Azure',lat:41.5908,lng:-93.6208,country:'US',region:'Iowa'},
+  {name:'Azure West Europe',provider:'Azure',lat:52.3676,lng:4.9041,country:'NL',region:'Netherlands'},
+  {name:'Azure North Europe',provider:'Azure',lat:53.3498,lng:-6.2603,country:'IE',region:'Dublin'},
+  {name:'Azure UK South',provider:'Azure',lat:51.5074,lng:-0.1278,country:'GB',region:'London'},
+  {name:'Azure Germany West Central',provider:'Azure',lat:50.1109,lng:8.6821,country:'DE',region:'Frankfurt'},
+  {name:'Azure France Central',provider:'Azure',lat:48.8566,lng:2.3522,country:'FR',region:'Paris'},
+  {name:'Azure Sweden Central',provider:'Azure',lat:59.3293,lng:18.0686,country:'SE',region:'Stockholm'},
+  {name:'Azure Japan East',provider:'Azure',lat:35.6762,lng:139.6503,country:'JP',region:'Tokyo'},
+  {name:'Azure Korea Central',provider:'Azure',lat:37.5665,lng:126.978,country:'KR',region:'Seoul'},
+  {name:'Azure Southeast Asia',provider:'Azure',lat:1.3521,lng:103.8198,country:'SG',region:'Singapore'},
+  {name:'Azure Australia East',provider:'Azure',lat:-33.8688,lng:151.2093,country:'AU',region:'Sydney'},
+  {name:'Azure Brazil South',provider:'Azure',lat:-23.5558,lng:-46.6396,country:'BR',region:'Sao Paulo'},
+  {name:'GCP us-central1',provider:'GCP',lat:41.2565,lng:-95.9345,country:'US',region:'Iowa'},
+  {name:'GCP us-east1',provider:'GCP',lat:33.749,lng:-84.388,country:'US',region:'South Carolina/Georgia'},
+  {name:'GCP us-west1',provider:'GCP',lat:45.5152,lng:-122.6784,country:'US',region:'Oregon'},
+  {name:'GCP northamerica-northeast1',provider:'GCP',lat:45.5017,lng:-73.5673,country:'CA',region:'Montreal'},
+  {name:'GCP europe-west1',provider:'GCP',lat:50.8503,lng:4.3517,country:'BE',region:'Belgium'},
+  {name:'GCP europe-west2',provider:'GCP',lat:51.5074,lng:-0.1278,country:'GB',region:'London'},
+  {name:'GCP europe-west3',provider:'GCP',lat:50.1109,lng:8.6821,country:'DE',region:'Frankfurt'},
+  {name:'GCP europe-west9',provider:'GCP',lat:48.8566,lng:2.3522,country:'FR',region:'Paris'},
+  {name:'GCP asia-east1',provider:'GCP',lat:25.033,lng:121.5654,country:'TW',region:'Taiwan'},
+  {name:'GCP asia-northeast1',provider:'GCP',lat:35.6762,lng:139.6503,country:'JP',region:'Tokyo'},
+  {name:'GCP asia-northeast3',provider:'GCP',lat:37.5665,lng:126.978,country:'KR',region:'Seoul'},
+  {name:'GCP asia-south1',provider:'GCP',lat:19.076,lng:72.8777,country:'IN',region:'Mumbai'},
+  {name:'GCP asia-southeast1',provider:'GCP',lat:1.3521,lng:103.8198,country:'SG',region:'Singapore'},
+  {name:'GCP australia-southeast1',provider:'GCP',lat:-33.8688,lng:151.2093,country:'AU',region:'Sydney'},
+  {name:'Oracle uk-london-1',provider:'Oracle',lat:51.5074,lng:-0.1278,country:'GB',region:'London'},
+  {name:'Oracle eu-frankfurt-1',provider:'Oracle',lat:50.1109,lng:8.6821,country:'DE',region:'Frankfurt'},
+  {name:'Oracle ap-singapore-1',provider:'Oracle',lat:1.3521,lng:103.8198,country:'SG',region:'Singapore'},
+  {name:'Oracle ap-tokyo-1',provider:'Oracle',lat:35.6762,lng:139.6503,country:'JP',region:'Tokyo'},
+  {name:'Alibaba Singapore',provider:'Alibaba Cloud',lat:1.3521,lng:103.8198,country:'SG',region:'Singapore'},
+  {name:'Alibaba Tokyo',provider:'Alibaba Cloud',lat:35.6762,lng:139.6503,country:'JP',region:'Tokyo'},
+  {name:'Alibaba Frankfurt',provider:'Alibaba Cloud',lat:50.1109,lng:8.6821,country:'DE',region:'Frankfurt'},
+  {name:'Alibaba London',provider:'Alibaba Cloud',lat:51.5074,lng:-0.1278,country:'GB',region:'London'}
+];
+
 function sanitizeLiveShipFeature(f,i=0){
   const geom=f?.geometry;
   const coords=geom?.coordinates;
@@ -427,16 +928,31 @@ function shipRecordToFeature(rec,i=0){
   if(rec.type==='Feature')return sanitizeLiveShipFeature(rec,i);
   const md=rec.Metadata||rec.MetaData||{};
   const msg=rec.Message||{};
+  const staticMsg=msg.ShipStaticData||msg.StaticDataReport||{};
   const pr=msg.PositionReport||msg.StandardClassBPositionReport||msg.ExtendedClassBPositionReport||msg.LongRangeAisBroadcastMessage||msg.StandardSearchAndRescueAircraftReport||{};
   const lng=parseFloat(rec.longitude??rec.lng??rec.lon??rec.Longitude??md.longitude??md.Longitude??md.lon??pr.Longitude);
   const lat=parseFloat(rec.latitude??rec.lat??rec.Latitude??md.latitude??md.Latitude??md.lat??pr.Latitude);
   if(!Number.isFinite(lat)||!Number.isFinite(lng))return null;
   const mmsi=String(rec.mmsi??rec.MMSI??md.MMSI??pr.UserID??rec.UserID??rec.id??'').trim();
-  const name=String((rec.name??rec.vesselName??rec.vessel_name??md.ShipName??md.shipName??mmsi)||`Vessel ${i+1}`).trim();
+  const name=String((rec.name??rec.vesselName??rec.vessel_name??md.ShipName??staticMsg.Name??staticMsg.ShipName??mmsi)||`Vessel ${i+1}`).trim();
   const headingRaw=rec.heading??rec.course??rec.cog??rec.Cog??rec.trueHeading??rec.TrueHeading??md.Cog??pr.Cog??pr.TrueHeading;
   const speed=rec.speed??rec.sog??rec.Sog??pr.Sog;
+  const course=rec.course??rec.cog??rec.Cog??pr.Cog;
+  const nav_status=rec.nav_status??rec.navStatus??pr.NavigationalStatus;
+  const call_sign=rec.call_sign??rec.callsign??rec.CallSign??staticMsg.CallSign;
+  const imo=rec.imo??staticMsg.IMO;
+  const vessel_type=rec.vessel_type??rec.ship_type??staticMsg.Type;
+  const destination=rec.destination??staticMsg.Destination;
+  const eta=rec.eta??staticMsg.ETA;
+  const draught=rec.draught??staticMsg.MaximumStaticDraught;
+  const dim_bow=toNum(staticMsg.Dimension?.A ?? staticMsg.DimensionToBow ?? staticMsg.DimensionA);
+  const dim_stern=toNum(staticMsg.Dimension?.B ?? staticMsg.DimensionToStern ?? staticMsg.DimensionB);
+  const dim_port=toNum(staticMsg.Dimension?.C ?? staticMsg.DimensionToPort ?? staticMsg.DimensionC);
+  const dim_starboard=toNum(staticMsg.Dimension?.D ?? staticMsg.DimensionToStarboard ?? staticMsg.DimensionD);
+  const length_m=Number.isFinite(dim_bow)&&Number.isFinite(dim_stern)? dim_bow+dim_stern : null;
+  const beam_m=Number.isFinite(dim_port)&&Number.isFinite(dim_starboard)? dim_port+dim_starboard : null;
   const source=rec.source||rec.feed||'Ship feed';
-  return {type:'Feature',geometry:{type:'Point',coordinates:[lng,lat]},properties:{...rec,id:mmsi||`ship-${i+1}`,mmsi,name,heading:Number.isFinite(parseFloat(headingRaw))?parseFloat(headingRaw):0,speed,source}};
+  return {type:'Feature',geometry:{type:'Point',coordinates:[lng,lat]},properties:{...rec,id:mmsi||`ship-${i+1}`,mmsi,name,heading:Number.isFinite(parseFloat(headingRaw))?parseFloat(headingRaw):0,speed,course,nav_status,call_sign,imo,vessel_type,destination,eta,draught,length_m,beam_m,source}};
 }
 function normalizeShipsPayload(payload){
   if(!payload)return {type:'FeatureCollection',features:[]};
@@ -469,6 +985,27 @@ function queueShipFlush(map){
     flushShipIndexToMap(map);
   },250);
 }
+
+function featureCollectionOrEmpty(fc){
+  if(fc && fc.type==='FeatureCollection' && Array.isArray(fc.features)) return fc;
+  if(Array.isArray(fc)) return {type:'FeatureCollection', features:fc.filter(Boolean)};
+  return {type:'FeatureCollection', features:[]};
+}
+function boundsParamFromMap(map){
+  try{
+    const b = map?.getBounds?.();
+    if(!b) return null;
+    const west = Number(b.getWest?.() ?? b._sw?.lng);
+    const south = Number(b.getSouth?.() ?? b._sw?.lat);
+    const east = Number(b.getEast?.() ?? b._ne?.lng);
+    const north = Number(b.getNorth?.() ?? b._ne?.lat);
+    if([west,south,east,north].every(Number.isFinite)) return {west,south,east,north};
+  }catch{}
+  return null;
+}
+globalThis.featureCollectionOrEmpty = featureCollectionOrEmpty;
+globalThis.boundsParamFromMap = boundsParamFromMap;
+
 function buildShipUrl(base,map,useViewport){
   const raw=String(base||'').trim();
   if(!raw)return '';
@@ -523,15 +1060,25 @@ function ensureLiveTrafficLayers(map){
   if(!map.getSource(LIVE_TRAFFIC_SOURCE_IDS.flights)){
     try{map.addSource(LIVE_TRAFFIC_SOURCE_IDS.flights,{type:'geojson',data:globalLiveTrafficRef.flightsFC});}catch{}
   }
+  if(!map.getLayer(`${LIVE_TRAFFIC_SOURCE_IDS.flights}-hit`)){
+    try{map.addLayer({id:`${LIVE_TRAFFIC_SOURCE_IDS.flights}-hit`,type:'circle',source:LIVE_TRAFFIC_SOURCE_IDS.flights,paint:{'circle-radius':10,'circle-opacity':0.001,'circle-stroke-opacity':0},layout:{visibility:'visible'}});}catch{}
+  }
   if(!map.getLayer(`${LIVE_TRAFFIC_SOURCE_IDS.flights}-sym`)){
     try{map.addLayer({id:`${LIVE_TRAFFIC_SOURCE_IDS.flights}-sym`,type:'symbol',source:LIVE_TRAFFIC_SOURCE_IDS.flights,layout:{'icon-image':flightIconId,'icon-size':1,'icon-allow-overlap':true,'icon-ignore-placement':true,'icon-anchor':'center','icon-pitch-alignment':'viewport','icon-rotation-alignment':'viewport','icon-rotate':['coalesce',['to-number',['get','heading']],0],visibility:'visible'},paint:{'icon-opacity':0.92}});}catch{}
   }
+  try{bindLiveTrafficPopup(map,`${LIVE_TRAFFIC_SOURCE_IDS.flights}-hit`);}catch{}
+  try{bindLiveTrafficPopup(map,`${LIVE_TRAFFIC_SOURCE_IDS.flights}-sym`);}catch{}
   if(!map.getSource(LIVE_TRAFFIC_SOURCE_IDS.ships)){
     try{map.addSource(LIVE_TRAFFIC_SOURCE_IDS.ships,{type:'geojson',data:globalLiveTrafficRef.shipsFC});}catch{}
+  }
+  if(!map.getLayer(`${LIVE_TRAFFIC_SOURCE_IDS.ships}-hit`)){
+    try{map.addLayer({id:`${LIVE_TRAFFIC_SOURCE_IDS.ships}-hit`,type:'circle',source:LIVE_TRAFFIC_SOURCE_IDS.ships,paint:{'circle-radius':10,'circle-opacity':0.001,'circle-stroke-opacity':0},layout:{visibility:'visible'}});}catch{}
   }
   if(!map.getLayer(`${LIVE_TRAFFIC_SOURCE_IDS.ships}-sym`)){
     try{map.addLayer({id:`${LIVE_TRAFFIC_SOURCE_IDS.ships}-sym`,type:'symbol',source:LIVE_TRAFFIC_SOURCE_IDS.ships,layout:{'icon-image':shipIconId,'icon-size':1,'icon-allow-overlap':true,'icon-ignore-placement':true,'icon-anchor':'center','icon-pitch-alignment':'viewport','icon-rotation-alignment':'viewport','icon-rotate':['coalesce',['to-number',['get','heading']],0],visibility:'visible'},paint:{'icon-opacity':0.92}});}catch{}
   }
+  try{bindLiveTrafficPopup(map,`${LIVE_TRAFFIC_SOURCE_IDS.ships}-hit`);}catch{}
+  try{bindLiveTrafficPopup(map,`${LIVE_TRAFFIC_SOURCE_IDS.ships}-sym`);}catch{}
   try{applyLiveTrafficData(map,'flights',globalLiveTrafficRef.flightsFC);}catch{}
   try{applyLiveTrafficData(map,'ships',globalLiveTrafficRef.shipsFC);}catch{}
 }
@@ -579,6 +1126,50 @@ async function fetchUSPortsReference(){
 async function fetchCarrierHomeportsReference(){
   return JSON.parse(JSON.stringify(US_AIRCRAFT_CARRIER_REFERENCE));
 }
+async function fetchShippingRoutesGlobal(){
+  // Source: newzealandpaul/Shipping-Lanes on GitHub (CC0/public domain)
+  // This repo contains global commercial shipping lane GeoJSON derived from AIS data.
+  const REPO_RAW='https://raw.githubusercontent.com/newzealandpaul/Shipping-Lanes/main';
+  const candidates=[
+    REPO_RAW+'/Shipping_Lanes_v1.geojson',
+    REPO_RAW+'/data/Shipping_Lanes_v1.geojson',
+    REPO_RAW+'/shipping_lanes.geojson',
+    'https://raw.githubusercontent.com/newzealandpaul/Shipping-Lanes/master/Shipping_Lanes_v1.geojson',
+    'https://raw.githubusercontent.com/newzealandpaul/Shipping-Lanes/master/data/Shipping_Lanes_v1.geojson',
+  ];
+  let lastErr=null;
+  for(const url of candidates){
+    try{
+      const r=await fetch(url,{cache:'no-store'});
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      const data=await r.json();
+      if(data&&data.features&&data.features.length>0){
+        console.log('Shipping lanes loaded:',data.features.length,'features from',url);
+        return data;
+      }
+    }catch(e){lastErr=e;}
+  }
+  // Fallback: built-in major corridors so the overlay always works
+  console.warn('Shipping-Lanes repo fetch failed, using built-in corridors:',lastErr&&lastErr.message);
+  return {type:'FeatureCollection',features:[
+    {type:'Feature',properties:{name:'North Atlantic'},geometry:{type:'LineString',coordinates:[[-5.3,36.0],[-14.9,35.5],[-25.0,37.0],[-40.0,38.0],[-55.0,43.0],[-65.5,44.6],[-73.9,40.7]]}},
+    {type:'Feature',properties:{name:'South Atlantic'},geometry:{type:'LineString',coordinates:[[-5.3,36.0],[-14.9,28.0],[-25.0,10.0],[-28.0,-15.0],[-35.0,-28.0],[-43.2,-22.9]]}},
+    {type:'Feature',properties:{name:'Europe-Asia via Suez'},geometry:{type:'LineString',coordinates:[[-5.3,36.0],[5.0,36.5],[18.0,37.5],[25.0,34.5],[32.3,29.9],[37.3,12.6],[43.5,11.5],[50.6,11.9],[60.0,22.2],[72.9,19.0],[80.3,13.1],[80.2,9.0],[103.8,1.3],[114.2,22.3]]}},
+    {type:'Feature',properties:{name:'Cape of Good Hope'},geometry:{type:'LineString',coordinates:[[18.4,-33.9],[25.0,-35.5],[35.0,-33.0],[45.0,-25.0],[55.0,-15.0],[72.9,19.0]]}},
+    {type:'Feature',properties:{name:'Trans-Pacific North'},geometry:{type:'LineString',coordinates:[[-73.9,40.7],[-100.0,27.0],[-120.0,22.0],[-140.0,20.0],[-160.0,21.0],[180.0,25.0],[160.0,30.0],[140.0,34.0],[130.0,33.5],[121.5,31.2]]}},
+    {type:'Feature',properties:{name:'Trans-Pacific South'},geometry:{type:'LineString',coordinates:[[-77.1,-12.0],[-100.0,-10.0],[-130.0,-10.0],[-150.0,-14.0],[175.0,-18.0],[160.0,-20.0],[153.0,-27.5],[151.2,-33.8]]}},
+    {type:'Feature',properties:{name:'Strait of Malacca'},geometry:{type:'LineString',coordinates:[[103.8,1.3],[102.0,3.5],[100.4,5.4],[99.0,6.5],[98.0,8.0]]}},
+    {type:'Feature',properties:{name:'Indian Ocean'},geometry:{type:'LineString',coordinates:[[50.6,11.9],[60.0,15.0],[66.0,20.0],[72.9,19.0],[80.2,9.0],[90.0,5.0],[103.8,1.3]]}},
+    {type:'Feature',properties:{name:'Panama Canal'},geometry:{type:'LineString',coordinates:[[-79.5,9.4],[-79.9,9.1],[-80.0,8.9]]}},
+    {type:'Feature',properties:{name:'Suez Canal'},geometry:{type:'LineString',coordinates:[[32.3,29.9],[32.5,27.0],[32.6,24.0]]}},
+    {type:'Feature',properties:{name:'Strait of Hormuz'},geometry:{type:'LineString',coordinates:[[56.5,24.5],[57.5,24.0],[58.5,22.5]]}},
+  ]};
+}
+
+async function fetchDataCentersGlobal(){
+  return normalizeRowsToPoints(BUILTIN_DATA_CENTER_REFERENCE,{latKeys:['lat'],lngKeys:['lng'],nameKeys:['name'],fallbackName:'Data Center',source:'datacente.rs-inspired cloud/data-center regions fallback'});
+}
+
 
 async function fetchCurrentViewMilitary(kind='airfield'){
   const map=globalMapRef.current;if(!map)throw new Error('Map not ready');
@@ -966,7 +1557,7 @@ const projSt=mkStore({
   activeSceneIdx:0,
 });
 
-const mapSt=mkStore({cam:{lng:14,lat:30,zoom:2.2,bearing:0,pitch:0},basemap:'dark-matter',basemapStack:[{id:'bm-dark-matter-1',basemapId:'dark-matter',title:'Dark Matter',visible:true,opacity:1}],showLabels:true,terrainEnabled:false,hillshadeEnabled:false,minimapEnabled:true,minimapZoomOffset:-3,minimapBox:{x:null,y:null,w:220,h:140},globeEnabled:false,globeAtmosphereEnabled:true,globeSpinEnabled:false,globeAtmosphereStyle:{spaceColor:'#000000',atmosphereBlend:1.0,atmosphereColor:'#6aa7ff',skyColor:'#0b1220',horizonColor:'#3a78ff',fogColor:'#0f172a',skyHorizonBlend:0.45,horizonFogBlend:0.8,fogGroundBlend:0.5},terrainExaggeration:1.4,stageBgColor:'#0b0d12',stageBgOpacity:1,stageBgMode:'solid',stageBgColor2:'#243b55',stageBgGradientAngle:135,stageBgVisible:true,stageLookEnabled:false,maskEnabled:false,maskInvert:false,maskSourceLayerId:null,studioLight:{azimuth:315,intensity:0.78,contrast:0.42,shadow:'#0f1723',highlight:'#e8eef7',accent:'#7f8fa3'},elevationM:null});
+const mapSt=mkStore({cam:{lng:14,lat:30,zoom:2.2,bearing:0,pitch:0},basemap:'osm-raster',basemapStack:[{id:'bm-osm-raster-1',basemapId:'osm-raster',title:'OpenStreetMap Raster',visible:true,opacity:1}],showLabels:true,terrainEnabled:false,hillshadeEnabled:false,minimapEnabled:true,minimapZoomOffset:-3,minimapBox:{x:null,y:null,w:220,h:140},globeEnabled:false,globeAtmosphereEnabled:true,globeSpinEnabled:false,globeAtmosphereStyle:{spaceColor:'#000000',atmosphereBlend:1.0,atmosphereColor:'#6aa7ff',skyColor:'#0b1220',horizonColor:'#3a78ff',fogColor:'#0f172a',skyHorizonBlend:0.45,horizonFogBlend:0.8,fogGroundBlend:0.5},terrainExaggeration:1.4,stageBgColor:'#0b0d12',stageBgOpacity:1,stageBgMode:'solid',stageBgColor2:'#243b55',stageBgGradientAngle:135,stageBgVisible:true,stageLookEnabled:false,maskEnabled:false,maskInvert:false,maskSourceLayerId:null,studioLight:{azimuth:315,intensity:0.78,contrast:0.42,shadow:'#0f1723',highlight:'#e8eef7',accent:'#7f8fa3'},tiles3dEnabled:false,tiles3dUrl:'',tiles3dAltOffset:0,tiles3dStatus:'idle',tiles3dError:'',tiles3dAutoFocus:false,tiles3dFocusZoom:16.5,tiles3dFocusPitch:55,tiles3dFocusBearing:0,tiles3dLastView:null,tiles3dIonToken:'',tiles3dIonAssetId:'96188',tiles3dIonTileAccessToken:'',tiles3dActiveRegionId:'',google3dEnabled:false,google3dApiKey:'',google3dStatus:'idle',google3dError:'',google3dAutoSync:false,google3dSkyAtmosphereEnabled:true,google3dLod:'LOD2',google3dCam:null,google3dShowBadge:true,elevationM:null});
 const routeSt=mkStore({draft:[],active:false});
 const layerSt=mkStore({feat:[],routes:[],arrows:[],borders:[],labels:[],markers:[],layerOrder:[],selId:null,_arrowDraft:null});
 const liveTrafficSt=mkStore({
@@ -977,7 +1568,7 @@ const liveTrafficSt=mkStore({
   flightsCount:0,
   flightsLastAt:'',
   shipsEnabled:false,
-  shipsUrl:'',
+  shipsUrl:(location.origin ? `${location.origin}/ais/ships` : 'http://127.0.0.1:7843/ais/ships'),
   shipsPollMs:15000,
   shipsUseViewport:true,
   shipsStatus:'idle',
@@ -1476,10 +2067,30 @@ function boundsToFeature(bounds){
   ]]},properties:{}}]};
 }
 
+const GOOGLE_3D_LOD_OPTIONS=[
+  {value:'LOD0',label:'LOD 0'},
+  {value:'LOD1',label:'LOD 1'},
+  {value:'LOD2',label:'LOD 2'},
+  {value:'LOD3',label:'LOD 3'},
+  {value:'LOD4',label:'LOD 4'},
+  {value:'LOD5',label:'LOD 5'},
+];
+function google3dLodToSSE(lod){
+  switch(String(lod||'LOD2')){
+    case 'LOD0': return 2;
+    case 'LOD1': return 4;
+    case 'LOD2': return 6;
+    case 'LOD3': return 8;
+    case 'LOD4': return 12;
+    case 'LOD5': return 16;
+    default: return 6;
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════
 function MapCanvas(){
-  const ctnRef=useRef(null);const mapRef=useRef(null);const miniRef=useRef(null);const miniMapRef=useRef(null);const miniSyncRef=useRef(false);const miniDragRef=useRef(null);const miniResizeRef=useRef(null);const styleSwapRef=useRef(false);const terrainApplyTokenRef=useRef(0);const terrainOptsRef=useRef({enabled:false,hillshade:false,exaggeration:1.4});const globeSpinRafRef=useRef(0);const globeSpinPauseUntilRef=useRef(0);const spinInternalMoveRef=useRef(false);const[ready,setReady]=useState(false);const isMoving=useRef(false);const[tick,bump]=useReducer(n=>n+1,0);const[reapplyTick,bumpReapply]=useReducer(n=>n+1,0);
-  const{cam,basemap,basemapStack,showLabels,terrainEnabled,hillshadeEnabled,minimapEnabled,minimapZoomOffset,minimapBox,globeEnabled,globeAtmosphereEnabled,globeSpinEnabled,globeAtmosphereStyle,terrainExaggeration,stageBgColor,stageBgOpacity,stageLookEnabled,maskEnabled,maskInvert,maskSourceLayerId,studioLight}=useStore(mapSt);const tool=useStore(appSt,s=>s.tool);const liveTraffic=useStore(liveTrafficSt);
+  const ctnRef=useRef(null);const mapRef=useRef(null);const cesiumHostRef=useRef(null);const cesiumViewerRef=useRef(null);const cesiumTilesetRef=useRef(null);const googleCamInternalRef=useRef(false);const miniRef=useRef(null);const miniMapRef=useRef(null);const miniSyncRef=useRef(false);const miniDragRef=useRef(null);const miniResizeRef=useRef(null);const styleSwapRef=useRef(false);const terrainApplyTokenRef=useRef(0);const terrainOptsRef=useRef({enabled:false,hillshade:false,exaggeration:1.4});const globeSpinRafRef=useRef(0);const globeSpinPauseUntilRef=useRef(0);const spinInternalMoveRef=useRef(false);const tiles3dCtlRef=useRef(null);const[ready,setReady]=useState(false);const isMoving=useRef(false);const[tick,bump]=useReducer(n=>n+1,0);const[reapplyTick,bumpReapply]=useReducer(n=>n+1,0);
+  const{cam,basemap,basemapStack,showLabels,terrainEnabled,hillshadeEnabled,minimapEnabled,minimapZoomOffset,minimapBox,globeEnabled,globeAtmosphereEnabled,globeSpinEnabled,globeAtmosphereStyle,terrainExaggeration,stageBgColor,stageBgOpacity,stageLookEnabled,maskEnabled,maskInvert,maskSourceLayerId,studioLight,tiles3dEnabled,tiles3dUrl,tiles3dAltOffset,tiles3dAutoFocus,tiles3dFocusZoom,tiles3dFocusPitch,tiles3dFocusBearing,tiles3dIonToken,tiles3dIonAssetId,tiles3dIonTileAccessToken,google3dEnabled,google3dApiKey,google3dStatus,google3dError,google3dAutoSync,google3dSkyAtmosphereEnabled,google3dLod,google3dShowBadge}=useStore(mapSt);const tool=useStore(appSt,s=>s.tool);const liveTraffic=useStore(liveTrafficSt);
 const clampMiniBox=useCallback((box)=>{
     const host=ctnRef.current;
     const hostW=host?.clientWidth||window.innerWidth||1280;
@@ -1522,6 +2133,191 @@ const clampMiniBox=useCallback((box)=>{
     return s;
   };
 
+
+  const mapZoomToCesiumHeight=(zoom,lat=0,pitch=0)=>{
+    const z=Math.max(0, Number(zoom)||0);
+    const latRad=(Number(lat)||0)*Math.PI/180;
+    const viewportH=Math.max(320, (ctnRef.current&&ctnRef.current.clientHeight)||720);
+    const metersPerPixel=156543.03392*Math.max(0.01, Math.cos(latRad))/Math.pow(2, z);
+    const baseHeight=metersPerPixel*viewportH*0.62;
+    const pitchFactor=1 + Math.max(0, Number(pitch)||0)/85*0.28;
+    return Math.max(45, baseHeight*pitchFactor);
+  };
+  const cesiumHeightToMapZoom=(height,lat=0,pitch=0)=>{
+    const h=Math.max(1, Number(height)||1);
+    const latRad=(Number(lat)||0)*Math.PI/180;
+    const viewportH=Math.max(320, (ctnRef.current&&ctnRef.current.clientHeight)||720);
+    const pitchFactor=1 + Math.max(0, Number(pitch)||0)/85*0.28;
+    const metersPerPixel=h/Math.max(1, viewportH*0.62*pitchFactor);
+    const denom=Math.max(1e-9, metersPerPixel);
+    const z=Math.log2((156543.03392*Math.max(0.01, Math.cos(latRad)))/denom);
+    return Math.max(0, Math.min(22, z));
+  };
+  const syncCesiumFromMap=useCallback((opts={})=>{
+    const viewer=cesiumViewerRef.current;
+    if(!viewer||typeof window.Cesium==='undefined') return;
+    const c=(opts&&opts.cam)||mapSt.get().cam||{};
+    const lng=Number(c.lng)||0;
+    const lat=Number(c.lat)||0;
+    const mapPitch=Math.max(0, Math.min(85, Number(c.pitch)||0));
+    const height=Math.max(45, mapZoomToCesiumHeight(c.zoom, lat, mapPitch));
+    const heading=Cesium.Math.toRadians(Number(c.bearing)||0);
+    const pitch=Cesium.Math.toRadians(mapPitch-90);
+    try{
+      googleCamInternalRef.current=true;
+      const destination=Cesium.Cartesian3.fromDegrees(lng, lat, height);
+      if(opts.fly){
+        viewer.camera.flyTo({destination, orientation:{heading,pitch,roll:0}, duration:0});
+      }else{
+        viewer.camera.setView({destination, orientation:{heading,pitch,roll:0}});
+      }
+      setTimeout(()=>{ googleCamInternalRef.current=false; }, 220);
+      viewer.scene.requestRender();
+    }catch(err){ googleCamInternalRef.current=false; console.warn('google3d sync failed', err); }
+  },[]);
+  useEffect(()=>{
+    const host=cesiumHostRef.current;
+    if(!host) return;
+    host.style.display=google3dEnabled?'block':'none';
+    if(!google3dEnabled) return;
+    if(typeof window.Cesium==='undefined'){
+      mapSt.set({google3dStatus:'CesiumJS missing',google3dError:'CesiumJS failed to load'});
+      return;
+    }
+    let viewer=cesiumViewerRef.current;
+    if(!viewer){
+      viewer=new Cesium.Viewer(host,{animation:false,timeline:false,homeButton:false,sceneModePicker:false,baseLayerPicker:false,geocoder:false,navigationHelpButton:false,fullscreenButton:false,selectionIndicator:false,infoBox:false,baseLayer:false,globe:false,requestRenderMode:false,shadows:false,contextOptions:{webgl:{alpha:false,preserveDrawingBuffer:true}}});
+      viewer.scene.skyAtmosphere.show=!!google3dSkyAtmosphereEnabled;
+      if(viewer.scene.skyBox) viewer.scene.skyBox.show=false;
+      viewer.scene.backgroundColor=Cesium.Color.BLACK;
+      viewer.scene.requestRenderMode=false;
+      viewer.useDefaultRenderLoop=true;
+      try{ viewer.resolutionScale=window.devicePixelRatio||1; }catch(_e){}
+      cesiumViewerRef.current=viewer;
+    }
+    try{ viewer.resize(); }catch(_e){}
+    if(!google3dApiKey){
+      mapSt.set({google3dStatus:'Enter Google Map Tiles API key',google3dError:'Missing API key'});
+      return;
+    }
+    Cesium.GoogleMaps.defaultApiKey=google3dApiKey;
+    const existing=cesiumTilesetRef.current;
+    try{
+      viewer.scene.skyAtmosphere.show=!!google3dSkyAtmosphereEnabled;
+      if(viewer.scene.skyBox) viewer.scene.skyBox.show=false;
+      existing && (existing.maximumScreenSpaceError=google3dLodToSSE(google3dLod));
+    }catch(_e){}
+    if(existing && existing.__googleKey===google3dApiKey){
+      mapSt.set({google3dStatus:'ready',google3dError:''});
+      const st=mapSt.get();
+      if(st.google3dCam && window.__mdGoogle3DApplyStoredCam) window.__mdGoogle3DApplyStoredCam(st.google3dCam,{fly:false});
+      else syncCesiumFromMap({fly:true});
+      viewer.scene.requestRender();
+      return;
+    }
+    if(existing){ try{ viewer.scene.primitives.remove(existing); }catch(_e){} cesiumTilesetRef.current=null; }
+    mapSt.set({google3dStatus:'loading',google3dError:''});
+    Promise.resolve(Cesium.createGooglePhotorealistic3DTileset({
+      onlyUsingWithGoogleGeocoder:true,
+      tilesetOptions:{showCreditsOnScreen:true,maximumScreenSpaceError:google3dLodToSSE(google3dLod)}
+    })).then((tileset)=>{
+      try{ tileset.maximumScreenSpaceError=google3dLodToSSE(google3dLod); }catch(_e){}
+      tileset.__googleKey=google3dApiKey;
+      cesiumTilesetRef.current=tileset;
+      viewer.scene.primitives.add(tileset);
+      return Promise.resolve(tileset.readyPromise).then(async()=>{
+        if(cesiumTilesetRef.current!==tileset) return;
+        try{
+          const st=mapSt.get();
+          if(st.google3dCam && window.__mdGoogle3DApplyStoredCam) window.__mdGoogle3DApplyStoredCam(st.google3dCam,{fly:false});
+          else await syncCesiumFromMap({fly:true});
+        }catch(_e){}
+        mapSt.set({google3dStatus:'ready',google3dError:''});
+        viewer.scene.requestRender();
+      });
+    }).catch(err=>{
+      if(cesiumTilesetRef.current===null || (err&&String(err).length)){
+        mapSt.set({google3dStatus:'error',google3dError:String(err&&err.message||err||'Failed to load Google 3D Tiles')});
+      }
+      console.error('google3d load failed', err);
+    });
+  },[google3dEnabled,google3dApiKey,google3dAutoSync,google3dSkyAtmosphereEnabled,google3dLod,syncCesiumFromMap]);
+  useEffect(()=>{
+    if(!google3dEnabled || !google3dAutoSync) return;
+    if(!cesiumViewerRef.current || !cesiumTilesetRef.current) return;
+    syncCesiumFromMap();
+  },[google3dEnabled,google3dAutoSync,cam.lng,cam.lat,cam.zoom,cam.bearing,cam.pitch,syncCesiumFromMap]);
+  useEffect(()=>{
+    if(!google3dEnabled) return;
+    const viewer=cesiumViewerRef.current;
+    const Cesium=window.Cesium;
+    if(!viewer||!Cesium||!viewer.camera) return;
+    const camObj=viewer.camera;
+    camObj.percentageChanged=0.0005;
+    let raf=0;
+    const onChanged=()=>{
+      if(googleCamInternalRef.current) return;
+      if(raf) cancelAnimationFrame(raf);
+      raf=requestAnimationFrame(()=>{
+        raf=0;
+        try{
+          const carto=camObj.positionCartographic;
+          if(!carto) return;
+          const lng=Cesium.Math.toDegrees(carto.longitude);
+          const lat=Cesium.Math.toDegrees(carto.latitude);
+          const zoom=cesiumHeightToMapZoom(carto.height, lat, 90 + Cesium.Math.toDegrees(camObj.pitch));
+          const bearing=((Cesium.Math.toDegrees(camObj.heading)%360)+360)%360;
+          const pitch=Math.max(0, Math.min(85, 90 + Cesium.Math.toDegrees(camObj.pitch)));
+          const st=mapSt.get();
+          const prev=(st.google3dCam)||{};
+          if(Math.abs((prev.lng||0)-lng)<1e-6 && Math.abs((prev.lat||0)-lat)<1e-6 && Math.abs((prev.zoom||0)-zoom)<1e-3 && Math.abs((prev.bearing||0)-bearing)<1e-3 && Math.abs((prev.pitch||0)-pitch)<1e-3) return;
+          mapSt.set({google3dCam:{lng,lat,zoom,bearing,pitch,height:carto.height}});
+        }catch(err){ console.warn('google3d reverse sync failed', err); }
+      });
+    };
+    camObj.changed.addEventListener(onChanged);
+    return ()=>{ if(raf) cancelAnimationFrame(raf); try{ camObj.changed.removeEventListener(onChanged); }catch(_e){} };
+  },[google3dEnabled]);
+  useEffect(()=>()=>{
+    try{ if(cesiumViewerRef.current) cesiumViewerRef.current.destroy(); }catch(_e){}
+    cesiumViewerRef.current=null; cesiumTilesetRef.current=null;
+  },[]);
+
+  window.__mdGoogle3DSync=syncCesiumFromMap;
+  window.__mdGoogle3DViewer=()=>cesiumViewerRef.current||null;
+  window.__mdGoogle3DGetCam=()=>{
+    const viewer=cesiumViewerRef.current; const Cesium=window.Cesium;
+    if(!viewer||!Cesium||!viewer.camera) return mapSt.get().google3dCam||null;
+    try{
+      const c=viewer.camera.positionCartographic; if(!c) return mapSt.get().google3dCam||null;
+      return {lng:Cesium.Math.toDegrees(c.longitude),lat:Cesium.Math.toDegrees(c.latitude),zoom:cesiumHeightToMapZoom(c.height, Cesium.Math.toDegrees(c.latitude), 90 + Cesium.Math.toDegrees(viewer.camera.pitch)),bearing:((Cesium.Math.toDegrees(viewer.camera.heading)%360)+360)%360,pitch:Math.max(0, Math.min(85, 90 + Cesium.Math.toDegrees(viewer.camera.pitch))),height:c.height};
+    }catch(_e){ return mapSt.get().google3dCam||null; }
+  };
+  window.__mdGoogle3DApplyStoredCam=(gc,opts={})=>{
+    const viewer=cesiumViewerRef.current; const Cesium=window.Cesium;
+    if(!viewer||!Cesium||!gc) return false;
+    try{
+      const pitch=Number(gc.pitch||0);
+      const lat=Number(gc.lat||0);
+      const height=Number.isFinite(Number(gc.height))?Number(gc.height):mapZoomToCesiumHeight(Number(gc.zoom||2), lat, pitch);
+      const dest=Cesium.Cartesian3.fromDegrees(Number(gc.lng||0), lat, Math.max(20,height));
+      const orientation={heading:Cesium.Math.toRadians(Number(gc.bearing||0)),pitch:Cesium.Math.toRadians(pitch-90),roll:0};
+      if(opts.fly) viewer.camera.flyTo({destination:dest,orientation,duration:0.8});
+      else viewer.camera.setView({destination:dest,orientation});
+      viewer.scene.requestRender();
+      return true;
+    }catch(err){ console.warn('apply stored google cam failed', err); return false; }
+  };
+  window.__mdGoogle3DPullToMap=()=>{ const gc=window.__mdGoogle3DGetCam&&window.__mdGoogle3DGetCam(); if(!gc) return false; const prev=mapSt.get().cam||{}; mapSt.set({cam:{...prev,lng:gc.lng,lat:gc.lat,zoom:gc.zoom,bearing:gc.bearing,pitch:gc.pitch},google3dCam:gc}); return true; };
+  window.__mdGetActiveViewportCanvas=()=>{
+    if(mapSt.get().google3dEnabled){
+      const viewer=cesiumViewerRef.current;
+      if(viewer){ try{ viewer.resize(); viewer.render(); }catch(_e){} }
+      return (viewer&&viewer.canvas) || document.querySelector('.cesium-widget canvas') || null;
+    }
+    const m=mapRef.current; return m&&m.getCanvas?m.getCanvas():null;
+  };
+
   const getStyleUrl=()=>{
     if(bm.isRaster)return buildStyleWithDem(bm.rasterStyle);
     if(bm.isWMTS){
@@ -1542,10 +2338,30 @@ const clampMiniBox=useCallback((box)=>{
   styleKeyRef.current=styleKey;
   const prevStyleRef=useRef(null);
 
+  const CORS_PROXY_PREFIX='https://corsproxy.io/?';
+  const shouldProxyTileUrl=(url='')=>{
+    try{
+      const u=new URL(url, window.location.href);
+      return [
+        'www.lightpollutionmap.info',
+        'lightpollutionmap.info',
+        'djlorenz.github.io',
+      ].includes(u.hostname);
+    }catch(_e){ return false; }
+  };
+  const proxifyUrl=(url='')=> shouldProxyTileUrl(url) ? `${CORS_PROXY_PREFIX}${encodeURIComponent(url)}` : url;
+
   useEffect(()=>{
     if(!ctnRef.current)return;
     const initStyle=typeof styleUrl==='object'?styleUrl:styleUrl;
-    const map=new maplibregl.Map({container:ctnRef.current,style:initStyle,center:[cam.lng,cam.lat],zoom:cam.zoom,bearing:cam.bearing,pitch:cam.pitch,maxPitch:85,attributionControl:false,pitchWithRotate:true,preserveDrawingBuffer:true,fadeDuration:0});
+    const map=new maplibregl.Map({container:ctnRef.current,style:initStyle,center:[cam.lng,cam.lat],zoom:cam.zoom,bearing:cam.bearing,pitch:cam.pitch,maxPitch:85,attributionControl:false,pitchWithRotate:true,preserveDrawingBuffer:true,fadeDuration:0,
+      transformRequest:(url,resourceType)=>{
+        if((resourceType==='Tile'||resourceType==='Image'||resourceType==='Source') && shouldProxyTileUrl(url)){
+          return {url: proxifyUrl(url)};
+        }
+        return {url};
+      }
+    });
     mapRef.current=map;globalMapRef.current=map;
     try{ if(maplibregl.GlobeControl) map.addControl(new maplibregl.GlobeControl(), 'top-right'); }catch{}
     map.on('load',()=>{
@@ -1810,9 +2626,10 @@ const clampMiniBox=useCallback((box)=>{
   const directCamSet=useCallback((c)=>{
     const map=mapRef.current;if(!map||!ready)return;
     map.jumpTo({center:[c.lng,c.lat],zoom:c.zoom,bearing:c.bearing,pitch:c.pitch});
+    if(mapSt.get().google3dEnabled && cesiumViewerRef.current && cesiumTilesetRef.current){ try{ syncCesiumFromMap({cam:c}); }catch(_e){} }
     lastCam.current=c; // keep lastCam in sync so cam-effect won't reset after playback stops
     bump();
-  },[ready]);
+  },[ready,syncCesiumFromMap]);
   useEffect(()=>{globalMapRef.directCam=directCamSet;},[directCamSet]);
 
   const startMiniDrag=(e)=>{
@@ -2197,15 +3014,19 @@ function addRasterBasemapLayer(map,item){
   }catch(err){}
 }
 function applyBasemapStackLayers(map){
+  // Remove all md-bm-* layers/sources then re-add every raster basemap in stack order.
+  // reorderViewportLayers will then place them in the correct z-order.
   try{
     const style=map.getStyle(); if(!style) return;
     style.layers.filter(l=>l.id.startsWith('md-bm-')).forEach(l=>{try{map.removeLayer(l.id);}catch{}});
     Object.keys(style.sources).filter(s=>s.startsWith('md-bm-')).forEach(s=>{try{map.removeSource(s);}catch{}});
-    const ordered=orderedVisualItems(layerSt.get(), mapSt.get()).filter(x=>x._t==='basemap'&&x.visible!==false);
-    const primary=getPrimaryBasemapItem(layerSt.get(), mapSt.get());
-    const primaryIdx=Math.max(0,ordered.findIndex(x=>x.id===primary?.id));
-    const overlays=(primary&&primaryIdx>=0?ordered.slice(0,primaryIdx):ordered.slice(0,-1)).filter(item=>(BASEMAPS.find(b=>b.id===item.basemapId)||{}).isRaster);
-    overlays.slice().reverse().forEach(item=>addRasterBasemapLayer(map,item));
+    const ordered=orderedVisualItems(layerSt.get(), mapSt.get());
+    const visibleBms=ordered.filter(item=>item._t==='basemap'&&item.visible!==false);
+    // Add bottom-to-top; reorderViewportLayers corrects final z-order
+    visibleBms.forEach(item=>{
+      const bm=BASEMAPS.find(b=>b.id===item.basemapId);
+      if(bm&&bm.isRaster) addRasterBasemapLayer(map,item);
+    });
   }catch(err){}
 }
 function applyPrimaryBasemapOpacity(map, layerState=layerSt.get(), mapState=mapSt.get()){
@@ -2237,41 +3058,61 @@ function applyPrimaryBasemapOpacity(map, layerState=layerSt.get(), mapState=mapS
   }catch(err){ console.warn('primary basemap opacity apply failed', err); }
 }
 function reorderViewportLayers(map){
+  // Layer panel: top of panel = highest z, bottom of panel = lowest z.
+  // orderedVisualItems[0]=bottom(lowest z) … [last]=top(highest z).
+  //
+  // Strategy: two-pass approach.
+  // Pass 1 (bottom→top): Move all md-* layers to top of the MapLibre stack
+  //   in REVERSE desired order, so they end up stacked correctly. Each
+  //   successive moveLayer(id) without a beforeId moves to the very top —
+  //   so iterating bottom→top results in top item being topmost.
+  // Pass 2: System layers (mask, minimap) always go on absolute top.
+  //
+  // For fg layers: simple moveLayer(id) bottom→top works.
+  // For raster basemaps: same — they have explicit md-bm-* layers.
+  // For vector primary basemap: its layers live in the native style and
+  //   cannot be moved above md-bm-* layers. The md-bm-* rasters always
+  //   land above the vector style layers after addRasterBasemapLayer.
+  //   So: rasters ABOVE the vector primary in panel = correct (they're on top).
+  //   Rasters BELOW the vector primary: they will appear above the vector
+  //   since we can't move native style layers. For now, honour the panel order
+  //   for rasters among themselves and all fg items.
   try{
     const style=map.getStyle(); if(!style) return;
-    const ordered=orderedVisualItems(layerSt.get(), mapSt.get());
-    const currentIds=()=> (map.getStyle()?.layers||[]).map(l=>l.id);
-    const collect=(item)=>currentIds().filter(id=>{
-      if(item._t==='basemap') return id.startsWith(`md-bm-${item.id}`);
-      if(item._t==='feat') return id.startsWith(`md-feat-${item.id}`);
-      if(item._t==='routes') return id.startsWith(`md-route-${item.id}`);
-      if(item._t==='borders') return id.startsWith(`md-border-${item.id}`);
-      if(item._t==='labels') return id.startsWith(`md-lbl-${item.id}`);
-      if(item._t==='markers') return id.startsWith(`md-mkr-${item.id}`);
-      if(item._t==='arrows') return id.startsWith(`md-arr-${item.id}`);
-      return false;
-    });
-    ordered.slice().reverse().forEach(item=>collect(item).forEach(id=>{try{map.moveLayer(id);}catch{}}));
-    const ids=currentIds();
-    const fgId=ids.find(id=>id.startsWith('md-feat-')||id.startsWith('md-route-')||id.startsWith('md-border-')||id.startsWith('md-arr-')||id.startsWith('md-lbl-')||id.startsWith('md-mkr-'));
-    try{
-      if(map.getLayer(STAGE_BG_LAYER_ID)){
-        if(fgId) map.moveLayer(STAGE_BG_LAYER_ID, fgId);
-        else map.moveLayer(STAGE_BG_LAYER_ID);
+    const ordered=orderedVisualItems(layerSt.get(), mapSt.get()); // [0]=bottom … [n]=top
+    const getIds=()=>(map.getStyle()?.layers||[]).map(l=>l.id);
+    const collect=(item)=>{
+      const ids=getIds();
+      if(item._t==='basemap')  return ids.filter(id=>id.startsWith(`md-bm-${item.id}`));
+      if(item._t==='feat')     return ids.filter(id=>id.startsWith(`md-feat-${item.id}`));
+      if(item._t==='routes')   return ids.filter(id=>id.startsWith(`md-route-${item.id}`));
+      if(item._t==='borders')  return ids.filter(id=>id.startsWith(`md-border-${item.id}`));
+      if(item._t==='labels')   return ids.filter(id=>id.startsWith(`md-lbl-${item.id}`));
+      if(item._t==='markers')  return ids.filter(id=>id.startsWith(`md-mkr-${item.id}`));
+      if(item._t==='arrows')   return ids.filter(id=>id.startsWith(`md-arr-${item.id}`));
+      return [];
+    };
+
+    // Stage background: always at absolute bottom of md-* layers
+    try{ if(map.getLayer(STAGE_BG_LAYER_ID)) map.moveLayer(STAGE_BG_LAYER_ID); }catch{}
+
+    // Move all ordered items bottom→top (each moveLayer(id) goes to top of stack,
+    // so iterating from lowest to highest results in correct stacking order).
+    const stackItems=ordered.filter(i=>i._t!=='stagebg'); // [0]=bottom, [last]=top
+    for(const item of stackItems){
+      const ids=collect(item);
+      if(!ids.length) continue; // vector primary basemap — skip, sits at bottom natively
+      // Move bottom sub-layer first, then each subsequent one goes above it
+      for(const id of ids){
+        try{ map.moveLayer(id); }catch{}
       }
-      if(map.getLayer(STAGE_MASK_LAYER_ID)){
-        if(fgId) map.moveLayer(STAGE_MASK_LAYER_ID, fgId);
-        else map.moveLayer(STAGE_MASK_LAYER_ID);
-      }
-      if(map.getLayer(STAGE_MASK_LINE_LAYER_ID)){
-        if(fgId) map.moveLayer(STAGE_MASK_LINE_LAYER_ID, fgId);
-        else map.moveLayer(STAGE_MASK_LINE_LAYER_ID);
-      }
-    }catch{}
-  }catch(err){}
+    }
+
+    // System layers always on absolute top
+    const sysTop=[STAGE_MASK_LAYER_ID,STAGE_MASK_LINE_LAYER_ID,'md-mini-viewport-fill','md-mini-viewport-line'];
+    sysTop.forEach(id=>{try{if(map.getLayer(id))map.moveLayer(id);}catch{}});
+  }catch(err){console.warn('reorder viewport layers failed',err);}
 }
-
-
 
 const STAGE_BG_SOURCE_ID='md-stage-bg-src';
 const STAGE_BG_LAYER_ID='md-stage-bg';
@@ -2369,6 +3210,7 @@ function getStageBackgroundCss(state=mapSt.get()){
 }
 globalThis.getResolvedStageBgOpacity = getResolvedStageBgOpacity;
 globalThis.toRgbaWithAlpha = toRgbaWithAlpha;
+globalThis.clampStageAlpha = clampStageAlpha;
 
 function makeStageFillStyle(ctx,w,h,state=mapSt.get()){
   const c1=state?.stageBgColor||'#0b0d12';
@@ -2383,6 +3225,7 @@ function makeStageFillStyle(ctx,w,h,state=mapSt.get()){
   const g=ctx.createLinearGradient(cx-dx, cy-dy, cx+dx, cy+dy);
   g.addColorStop(0,c1); g.addColorStop(1,c2); return g;
 }
+globalThis.makeStageFillStyle = makeStageFillStyle;
 function ensureStageBackgroundLayer(map,color='#0b0d12',opacity=1){
   if(!map) return;
   const state=mapSt.get();
@@ -2744,6 +3587,76 @@ function bindHoverTooltip(map,layerId){
   try{map.on('mousemove',layerId,show);map.on('mouseleave',layerId,hide);}catch{}
 }
 
+function formatLiveTrafficPopupHTML(props={}){
+  const p=props||{};
+  const isShip=!!(p.mmsi||p.vessel_type||p.call_sign||p.imo||String(p.source||'').toLowerCase().includes('ship'));
+  const isAircraft=!!(p.icao24||p.origin_country||p.geo_altitude_m!=null||p.baro_altitude_m!=null||String(p.source||'').toLowerCase().includes('opensky'));
+  const title=String(p.name||p.callsign||p.flight||p.label||p.title||p.mmsi||p.icao24||'Unknown').trim();
+  const rows=[];
+  const add=(label,val)=>{
+    if(val==null||val==='') return;
+  };
+  const push=(label,val)=>{
+    if(val==null||val==='') return;
+    rows.push(`<div style="display:flex;gap:8px;justify-content:space-between"><span style="color:rgba(255,255,255,.56)">${escapeHtml(label)}</span><span style="text-align:right">${escapeHtml(val)}</span></div>`);
+  };
+  if(isShip){
+    push('MMSI', p.mmsi);
+    push('Call sign', p.call_sign||p.callsign);
+    push('IMO', p.imo);
+    push('Type', p.vessel_type);
+    push('Status', p.nav_status);
+    push('Speed', p.speed!=null ? `${Number(p.speed).toFixed(1)} kn` : '');
+    push('Course', p.course!=null ? `${Math.round(Number(p.course))}°` : '');
+    push('Heading', p.heading!=null ? `${Math.round(Number(p.heading))}°` : '');
+    push('Destination', p.destination);
+    push('ETA', p.eta);
+    if(p.length_m||p.beam_m) push('Size', `${p.length_m||'?'}m × ${p.beam_m||'?'}m`);
+    push('Source', p.source);
+  }else if(isAircraft){
+    push('Callsign', p.callsign||p.flight);
+    push('ICAO24', p.icao24);
+    push('Country', p.origin_country);
+    push('Speed', p.velocity_kts!=null ? `${Math.round(Number(p.velocity_kts))} kt` : (p.velocity!=null ? `${Math.round(Number(p.velocity))} m/s` : ''));
+    push('Track', p.heading!=null ? `${Math.round(Number(p.heading))}°` : (p.true_track!=null ? `${Math.round(Number(p.true_track))}°` : ''));
+    push('Altitude', p.geo_altitude_ft!=null ? `${Math.round(Number(p.geo_altitude_ft)).toLocaleString()} ft` : (p.baro_altitude_ft!=null ? `${Math.round(Number(p.baro_altitude_ft)).toLocaleString()} ft` : ''));
+    push('Vertical', p.vertical_rate_fpm!=null ? `${Math.round(Number(p.vertical_rate_fpm)).toLocaleString()} fpm` : (p.vertical_rate!=null ? `${Number(p.vertical_rate).toFixed(1)} m/s` : ''));
+    push('Squawk', p.squawk);
+    push('On ground', p.on_ground===true ? 'Yes' : (p.on_ground===false ? 'No' : ''));
+    push('Source', p.source);
+  }else{
+    const info=inferHoverLabelFromProperties(p);
+    push('Name', info?.primary||'');
+    if(info?.secondary) push('Info', info.secondary);
+  }
+  return `<div style="min-width:180px;max-width:260px;color:#f5f7fb;font:500 11px/1.35 Inter,system-ui,sans-serif;letter-spacing:.01em"><div style="margin-bottom:6px;font-size:12px">${escapeHtml(title)}</div>${rows.join('')}</div>`;
+}
+function bindLiveTrafficPopup(map,layerId){
+  if(!map||!layerId) return;
+  if(!map.__mdLiveHoverBound) map.__mdLiveHoverBound=new Set();
+  if(map.__mdLiveHoverBound.has(layerId)) return;
+  map.__mdLiveHoverBound.add(layerId);
+  const popup=getMapHoverPopup(map);
+  const show=(e)=>{
+    const f=e?.features?.[0];
+    if(!popup||!f?.properties) return;
+    const lngLat = e?.lngLat || (f.geometry?.coordinates ? {lng:f.geometry.coordinates[0], lat:f.geometry.coordinates[1]} : null);
+    if(!lngLat) return;
+    try{
+      popup.setLngLat(lngLat).setHTML(formatLiveTrafficPopupHTML(f.properties)).addTo(map);
+      map.getCanvas().style.cursor='pointer';
+    }catch{}
+  };
+  const hide=()=>{ try{ popup&&popup.remove(); map.getCanvas().style.cursor=''; }catch{} };
+  try{
+    map.on('mousemove',layerId,show);
+    map.on('click',layerId,show);
+    map.on('mouseleave',layerId,hide);
+  }catch{}
+}
+globalThis.formatLiveTrafficPopupHTML = formatLiveTrafficPopupHTML;
+globalThis.bindLiveTrafficPopup = bindLiveTrafficPopup;
+
 function addFeatLayer(map,fl){
   if(!fl.geojson)return;
   const sid=`md-feat-${fl.id}`;
@@ -2783,6 +3696,45 @@ function addFeatLayer(map,fl){
     }
   }
 }
+useEffect(()=>{
+  const onStatus=e=>{
+    const d=(e&&e.detail)||{};
+    const patch={tiles3dStatus:d.status||'idle',tiles3dError:d.error||'',tiles3dActiveRegionId:d.regionId||d.activeRegionId||''};
+    if(Number.isFinite(d.lng) && Number.isFinite(d.lat)){
+      patch.tiles3dLastView={
+        center:[d.lng,d.lat],
+        alt:Number.isFinite(d.alt)?d.alt:0,
+        radius:Number.isFinite(d.radius)?d.radius:0,
+        zoom:Number.isFinite(+mapSt.get().tiles3dFocusZoom)?+mapSt.get().tiles3dFocusZoom:17.5,
+        pitch:Number.isFinite(+mapSt.get().tiles3dFocusPitch)?+mapSt.get().tiles3dFocusPitch:60,
+        bearing:Number.isFinite(+mapSt.get().tiles3dFocusBearing)?+mapSt.get().tiles3dFocusBearing:0,
+      };
+    }
+    mapSt.set(patch);
+  };
+  window.addEventListener('md:3dtiles-status', onStatus);
+  return()=>window.removeEventListener('md:3dtiles-status', onStatus);
+},[]);
+useEffect(()=>{
+  const map=mapRef.current;if(!map||!ready)return;
+  if(!tiles3dCtlRef.current && window.MapDirector3DTiles && window.MapDirector3DTiles.createController){
+    tiles3dCtlRef.current=window.MapDirector3DTiles.createController(map, ()=>{
+      const s=mapSt.get();
+      return { enabled:s.tiles3dEnabled, url:s.tiles3dUrl, altOffset:s.tiles3dAltOffset, autoFocus:s.tiles3dAutoFocus, focusZoom:s.tiles3dFocusZoom, focusPitch:s.tiles3dFocusPitch, focusBearing:s.tiles3dFocusBearing, ionAssetId:s.tiles3dIonAssetId, ionTileAccessToken:s.tiles3dIonTileAccessToken };
+    });
+    window.__mdTiles3dCtl=tiles3dCtlRef.current;
+  }
+  const ctl=tiles3dCtlRef.current;
+  if(!ctl) return;
+  const apply=()=>ctl.sync();
+  if(map.isStyleLoaded()) apply(); else map.once('style.load', apply);
+},[ready,reapplyTick,globeEnabled,tiles3dEnabled,tiles3dUrl,tiles3dAltOffset,tiles3dAutoFocus,tiles3dFocusZoom,tiles3dFocusPitch,tiles3dFocusBearing,tiles3dIonAssetId,tiles3dIonTileAccessToken]);
+useEffect(()=>{
+  const map=mapRef.current;if(!map||!ready)return;
+  const onStyle=()=>{ try{ tiles3dCtlRef.current && tiles3dCtlRef.current.sync(); }catch{} };
+  map.on('style.load', onStyle);
+  return()=>{ try{ map.off('style.load', onStyle); }catch{} };
+},[ready]);
 useEffect(()=>{const map=mapRef.current;if(!map||!ready)return;const apply=()=>{const style=map.getStyle();if(!style)return;style.layers.filter(l=>l.id.startsWith('md-feat-')).forEach(l=>{try{map.removeLayer(l.id);}catch{}});Object.keys(style.sources).filter(s=>s.startsWith('md-feat-')).forEach(s=>{try{map.removeSource(s);}catch{}});feat.forEach(fl=>addFeatLayer(map,fl));};if(map.isStyleLoaded())apply();else map.once('style.load',apply);},[feat,ready,reapplyTick]);
   useEffect(()=>{const map=mapRef.current;if(!map||!ready)return;const apply=()=>{const style=map.getStyle();if(!style)return;style.layers.filter(l=>l.id.startsWith('md-route-')).forEach(l=>{try{map.removeLayer(l.id);}catch{}});Object.keys(style.sources).filter(s=>s.startsWith('md-route-')).forEach(s=>{try{map.removeSource(s);}catch{}});routes.forEach(rl=>addRouteLayer(map,rl));};if(map.isStyleLoaded())apply();else map.once('style.load',apply);},[routes,ready,reapplyTick]);
   useEffect(()=>{const map=mapRef.current;if(!map||!ready)return;const apply=()=>{const style=map.getStyle();if(!style)return;style.layers.filter(l=>l.id.startsWith('md-border-')).forEach(l=>{try{map.removeLayer(l.id);}catch{}});Object.keys(style.sources).filter(s=>s.startsWith('md-border-')).forEach(s=>{try{map.removeSource(s);}catch{}});borders.forEach(bl=>addBorderLayer(map,bl));};if(map.isStyleLoaded())apply();else map.once('style.load',apply);},[borders,ready,reapplyTick]);
@@ -2838,7 +3790,7 @@ useEffect(()=>{const map=mapRef.current;if(!map||!ready)return;const apply=()=>{
         liveTrafficSt.set({flightsStatus:`error: ${err.message}`});
       }
     };
-    if(live.flightsEnabled){tick();timer=setInterval(tick, Math.max(5000, Number(live.flightsPollMs)||15000));}
+    if(live.flightsEnabled){tick();timer=setInterval(tick, Math.max(15000, Number(live.flightsPollMs)||30000));}
     else {clearLiveTraffic('flights',map);liveTrafficSt.set({flightsStatus:'idle',flightsCount:0});}
     return()=>{cancelled=true;if(timer)clearInterval(timer);};
   },[ready,liveTraffic.flightsEnabled,liveTraffic.flightsPollMs,liveTraffic.flightsUseViewport]);
@@ -3023,10 +3975,12 @@ useEffect(()=>{const map=mapRef.current;if(!map||!ready)return;const apply=()=>{
   const cancelLabel=()=>{setPendingLabel(null);labelSt.set({placing:null});appSt.set({tool:'select'});};
 
   return(<div style={{position:'relative',width:'100%',height:'100%',overflow:'hidden'}}>
-    <div ref={ctnRef} style={{width:'100%',height:'100%'}}/>
+    <div ref={ctnRef} style={{width:'100%',height:'100%',opacity:google3dEnabled?0:1,pointerEvents:google3dEnabled?'none':'auto'}}/>
+    <div ref={cesiumHostRef} style={{position:'absolute',inset:0,zIndex:5,display:google3dEnabled?'block':'none'}}/>
+    {google3dEnabled&&google3dShowBadge&&<div className="md-google3d-badge">Google Maps 3D</div>}
     {!ready&&<div style={{position:'absolute',inset:0,background:'var(--bg-base)',display:'flex',alignItems:'center',justifyContent:'center',gap:10}}><div style={{width:16,height:16,border:'2px solid var(--accent-bdr)',borderTopColor:'var(--accent)',borderRadius:'50%',animation:'spin .8s linear infinite'}}/><span style={{color:'var(--txt3)',fontFamily:'var(--fm)',fontSize:11}}>Loading map…</span></div>}
     {/* Overlay HUD — AE-style bezier + position drag */}
-    {ready&&(()=>{
+    {!google3dEnabled&&ready&&(()=>{
       const map=mapRef.current; if(!map) return null;
       /* ── shared helpers ── */
       const geo2s=ll=>map.project([ll.lng,ll.lat]);
@@ -3402,7 +4356,7 @@ function GlobeAtmospherePanel(){
 
 
 function BasemapPanel(){
-  const{basemap,basemapStack,showLabels,terrainEnabled,hillshadeEnabled,minimapEnabled,stageLookEnabled,globeEnabled,globeAtmosphereEnabled,globeSpinEnabled,globeAtmosphereStyle,terrainExaggeration}=useStore(mapSt);
+  const{basemap,basemapStack,showLabels,terrainEnabled,hillshadeEnabled,minimapEnabled,stageLookEnabled,globeEnabled,globeAtmosphereEnabled,globeSpinEnabled,globeAtmosphereStyle,terrainExaggeration,tiles3dEnabled,tiles3dUrl,tiles3dAltOffset,tiles3dStatus,tiles3dError,tiles3dAutoFocus,tiles3dFocusZoom,tiles3dFocusPitch,tiles3dFocusBearing,tiles3dLastView,tiles3dIonToken,tiles3dIonAssetId,tiles3dActiveRegionId,google3dEnabled,google3dApiKey,google3dStatus,google3dError,google3dAutoSync,google3dSkyAtmosphereEnabled,google3dLod}=useStore(mapSt);
   const cats=[...new Set(BASEMAPS.map(b=>b.cat))];
   const addToStack=(bmId)=>{
     const layer=makeBasemapLayer(bmId);
@@ -3434,6 +4388,27 @@ function BasemapPanel(){
       <ToggleSwitch on={globeEnabled} onToggle={()=>mapSt.set(s=>({globeEnabled:!s.globeEnabled}))} label="Globe Mode"/>
       <ToggleSwitch on={globeAtmosphereEnabled} onToggle={()=>mapSt.set(s=>({globeAtmosphereEnabled:!s.globeAtmosphereEnabled}))} label="Globe Atmosphere"/>
       <ToggleSwitch on={globeSpinEnabled} onToggle={()=>mapSt.set(s=>({globeSpinEnabled:!s.globeSpinEnabled}))} label="Auto Orbit"/>
+      <div style={{marginTop:2,padding:'8px 9px',background:'var(--bg-elevated)',border:'1px solid var(--border)',borderRadius:6,display:'flex',flexDirection:'column',gap:7}}>
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8}}>
+          <div>
+            <div style={{fontSize:10,fontFamily:'var(--fm)',color:'var(--txt2)',letterSpacing:'.08em'}}>GOOGLE MAPS 3D</div>
+            <div style={{fontSize:10,color:'var(--txt3)',marginTop:2}}>Dual-engine CesiumJS mode · Photorealistic 3D Tiles</div>
+          </div>
+          <ToggleSwitch on={google3dEnabled} onToggle={()=>mapSt.set(s=>({google3dEnabled:!s.google3dEnabled, globeEnabled:false}))} label=""/>
+        </div>
+        <input value={google3dApiKey} onChange={e=>mapSt.set({google3dApiKey:e.target.value})} placeholder="Paste Google Map Tiles API key" style={{width:'100%',padding:'7px 8px',background:'var(--bg-base)',border:'1px solid var(--border)',borderRadius:6,color:'var(--txt)',fontSize:11,fontFamily:'var(--fm)'}}/>
+        <ToggleSwitch on={google3dSkyAtmosphereEnabled} onToggle={()=>mapSt.set(s=>({google3dSkyAtmosphereEnabled:!s.google3dSkyAtmosphereEnabled}))} label="Google 3D Sky Atmosphere"/>
+        <SelectInput label="LOD" value={google3dLod} onChange={v=>mapSt.set({google3dLod:v})} options={GOOGLE_3D_LOD_OPTIONS} lw={44}/>
+        <ToggleSwitch on={google3dAutoSync} onToggle={()=>mapSt.set(s=>({google3dAutoSync:!s.google3dAutoSync}))} label="Auto-sync camera from MapLibre"/>
+        <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+          <button onClick={()=>{ const hasGc=!!mapSt.get().google3dCam; mapSt.set(s=>({google3dEnabled:true, globeEnabled:false})); if(!hasGc){ setTimeout(()=>{ const host=window.__mdGoogle3DSync||null; if(host) host({fly:true}); },50); } }} style={{padding:'7px 8px',background:'var(--bg-base)',border:'1px solid var(--border)',borderRadius:6,color:'var(--txt2)',fontSize:10,cursor:'pointer'}}>Open Google 3D</button>
+          <button onClick={()=>{ const host=window.__mdGoogle3DSync||null; if(host) host(); }} style={{padding:'7px 8px',background:'var(--bg-base)',border:'1px solid var(--border)',borderRadius:6,color:'var(--txt2)',fontSize:10,cursor:'pointer'}}>Match from MapLibre</button>
+          <button onClick={()=>{ const pull=window.__mdGoogle3DPullToMap||null; if(pull) pull(); }} style={{padding:'7px 8px',background:'var(--bg-base)',border:'1px solid var(--border)',borderRadius:6,color:'var(--txt2)',fontSize:10,cursor:'pointer'}}>Pull framing to MapLibre</button>
+          <button onClick={()=>mapSt.set({google3dEnabled:false})} style={{padding:'7px 8px',background:'var(--bg-base)',border:'1px solid var(--border)',borderRadius:6,color:'var(--txt2)',fontSize:10,cursor:'pointer'}}>Hide Google 3D</button>
+        </div>
+        <div style={{fontSize:10,color:'var(--txt3)'}}>Status: {google3dStatus}{google3dError?` · ${google3dError}`:''}</div>
+        <div style={{fontSize:10,color:'var(--txt4)',lineHeight:1.45}}>Uses CesiumJS with Google Photorealistic 3D Tiles. Treat this as a separate shot camera: match from MapLibre, adjust in 3D, then pull framing back when needed.</div>
+      </div>
       <Slider label="TERRAIN" value={terrainExaggeration} onChange={v=>mapSt.set({terrainExaggeration:v})} min={1} max={2} step={0.05} unit="×"/>
     </div>
   </div>);
@@ -3448,6 +4423,18 @@ function OverlaysPanel(){
   const live=useStore(liveTrafficSt);
   const [loadingId,setLoadingId]=useState(null);
   const [err,setErr]=useState('');
+  const [relayInfo,setRelayInfo]=useState('');
+  const setLocalHttp=()=>liveTrafficSt.set({shipsUrl:AIS_HTTP_LOCAL});
+  const setLocalWs=()=>liveTrafficSt.set({shipsUrl:AIS_WS_LOCAL});
+  const checkRelay=async()=>{
+    try{
+      setRelayInfo('checking…');
+      const info=await pingLocalAisRelay();
+      setRelayInfo(`relay ${info.connected?'online':'offline'}${info.vesselCount!=null?` · ${info.vesselCount} vessels`:''}`);
+    }catch(e){
+      setRelayInfo(`relay error: ${e.message}`);
+    }
+  };
   const loadOverlay=async(src)=>{
     setLoadingId(src.id);setErr('');
     try{
@@ -3467,6 +4454,8 @@ function OverlaysPanel(){
       else if(src.loader==='milAir')geojson=await fetchCurrentViewMilitary('airfield');
       else if(src.loader==='naval')geojson=await fetchCurrentViewMilitary('naval');
       else if(src.loader==='carrierRef')geojson=await fetchCarrierHomeportsReference();
+      else if(src.loader==='shippingRoutes')geojson=await fetchShippingRoutesGlobal();
+      else if(src.loader==='dataCenters')geojson=await fetchDataCentersGlobal();
       addOverlayLayer(src,geojson);
     }catch(e){setErr(`${src.label}: ${e.message}`);}finally{setLoadingId(null);}
   };
@@ -3479,7 +4468,7 @@ function OverlaysPanel(){
         <div style={{fontSize:9,fontFamily:'var(--fm)',color:'var(--txt3)',letterSpacing:'.08em'}}>LIVE TRAFFIC</div>
         <div style={{display:'grid',gridTemplateColumns:'1fr auto',gap:8,alignItems:'center'}}>
           <div>
-            <div style={{fontSize:11,color:'var(--txt)',fontWeight:600}}>Aircraft · OpenSky</div>
+            <div style={{fontSize:11,color:'var(--txt)',fontWeight:600}}>Aircraft · OpenSky (Relay → Public)</div>
             <div style={{fontSize:9,color:'var(--txt3)',fontFamily:'var(--fm)'}}>{live.flightsStatus}{live.flightsCount?` · ${live.flightsCount} tracks`:''}{live.flightsLastAt?` · ${live.flightsLastAt}`:''}</div>
           </div>
           <div style={{display:'flex',gap:6}}>
@@ -3500,12 +4489,18 @@ function OverlaysPanel(){
             <Btn sz="xs" v={live.shipsEnabled?'solid':'ghost'} onClick={()=>liveTrafficSt.set(s=>({shipsEnabled:!s.shipsEnabled}))}>{live.shipsEnabled?'Stop':'Start'}</Btn>
           </div>
         </div>
-        <input value={live.shipsUrl} onChange={e=>liveTrafficSt.set({shipsUrl:e.target.value})} placeholder="https://your-proxy.example/ships or ws://localhost:8787/ships" style={{width:'100%',padding:'6px 8px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--txt)',fontSize:10}} />
+        <input value={live.shipsUrl} onChange={e=>liveTrafficSt.set({shipsUrl:e.target.value})} placeholder="http://127.0.0.1:7843/ais/ships or ws://127.0.0.1:7843/ais/ws" style={{width:'100%',padding:'6px 8px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--txt)',fontSize:10}} />
+        <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+          <Btn sz="xs" v="solid" onClick={setLocalHttp}>Local HTTP</Btn>
+          <Btn sz="xs" v="solid" onClick={setLocalWs}>Local WS</Btn>
+          <Btn sz="xs" v="ghost" onClick={checkRelay}>Check Relay</Btn>
+        </div>
+        {relayInfo&&<div style={{fontSize:9,color:'var(--txt3)',fontFamily:'var(--fm)'}}>{relayInfo}</div>}
         <div style={{display:'grid',gridTemplateColumns:'1fr 86px',gap:8,alignItems:'center'}}>
           <label style={{display:'flex',alignItems:'center',gap:6,fontSize:10,color:'var(--txt2)'}}><input type="checkbox" checked={!!live.shipsUseViewport} onChange={e=>liveTrafficSt.set({shipsUseViewport:e.target.checked})}/>Pass current bbox</label>
           <input value={live.shipsPollMs} onChange={e=>liveTrafficSt.set({shipsPollMs:Math.max(5000,parseInt(e.target.value||'15000',10)||15000)})} style={{width:'100%',padding:'4px 6px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--txt)',fontSize:10}} title="poll ms" />
         </div>
-        <div style={{fontSize:9,color:'var(--txt3)',lineHeight:'13px'}}>For ships, use your own HTTP or WebSocket relay. Direct browser connections to AISStream are not supported because the API key would be exposed.</div>
+        <div style={{fontSize:9,color:'var(--txt3)',lineHeight:'13px'}}>This build is wired for one local backend: <span style={{fontFamily:'var(--fm)'}}>GET /ais/ships</span>, <span style={{fontFamily:'var(--fm)'}}>WS /ais/ws</span>, <span style={{fontFamily:'var(--fm)'}}>GET /ais/health</span>, <span style={{fontFamily:'var(--fm)'}}>GET /air/flights</span>, <span style={{fontFamily:'var(--fm)'}}>GET /air/health</span>, and <span style={{fontFamily:'var(--fm)'}}>WS /ws</span> for MP4 export.</div>
       </div>
       {cats.map(cat=>(<div key={cat}>
         <div style={{fontSize:9,fontFamily:'var(--fm)',color:'var(--txt3)',marginBottom:5,letterSpacing:'.08em'}}>{cat.toUpperCase()}</div>
@@ -3846,8 +4841,8 @@ function LayersPanel(){
     if(type==='basemap'){
       mapSt.set(s=>{
         const next=(s.basemapStack||[]).filter(l=>l.id!==id);
-        const fallback=next.length?next[next.length-1].basemapId:'dark-matter';
-        return {basemapStack:next.length?next:[makeBasemapLayer('dark-matter')],basemap:fallback};
+        const fallback=next.length?next[next.length-1].basemapId:'osm-raster';
+        return {basemapStack:next.length?next:[makeBasemapLayer('osm-raster')],basemap:fallback};
       });
       layerSt.set(s=>({layerOrder:(s.layerOrder||[]).filter(x=>x!==id),selId:s.selId===id?null:s.selId}));
       return;
@@ -3911,7 +4906,7 @@ function LayersPanel(){
         <Ic n="grip" s={12} c="var(--txt3)"/>
         <Ic n={l._ic} s={12} c={l._c||'var(--txt3)'}/>
         <span style={{flex:1,fontSize:11,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',color:selId===l.id?'var(--txt)':'var(--txt2)'}}>{l.title}</span>
-        <Tag c="var(--txt3)">{l._t}</Tag>
+        <Tag c="var(--txt3)">{l._t==='basemap'?((BASEMAPS.find(b=>b.id===l.basemapId)||{}).isRaster?'raster':'vector'):l._t==='feat'&&l.meta?.overlay?'overlay':l._t}</Tag>
         {l._t!=='stagebg'&&<button onClick={e=>{e.stopPropagation();ensureTrack(l.id,l.title);}} title="Add timeline layer block" style={{background:'none',border:'none',cursor:'pointer',color:'var(--cyan)',fontSize:11,padding:'0 2px',lineHeight:1}} onMouseEnter={e=>e.currentTarget.style.color='var(--accent)'} onMouseLeave={e=>e.currentTarget.style.color='var(--cyan)'}>▭</button>}
         <Btn sz="xs" v="ghost" onClick={e=>{e.stopPropagation();togVis(l._t,l.id);}}><Ic n={l.visible?'eye':'eyeOff'} s={11} c="var(--txt3)"/></Btn>
         {l._t!=='stagebg'&&<Btn sz="xs" v="ghost" onClick={e=>{e.stopPropagation();del(l._t,l.id);}}><Ic n="trash" s={10} c="var(--red)"/></Btn>}
@@ -4097,6 +5092,17 @@ function SearchPanel({onClose}){
 // Wait for MapLibre to finish rendering a frame after a camera change
 const SERVER_WS  = 'ws://127.0.0.1:7843/ws';
 const SERVER_HTTP = 'http://127.0.0.1:7843';
+const AIS_HTTP_LOCAL = (()=>{ try{return `${window.location.origin}/ais/ships`;}catch{return 'http://127.0.0.1:7843/ais/ships';} })();
+const AIS_WS_LOCAL = (()=>{ try{ const u=new URL(window.location.origin); const proto=u.protocol==='https:'?'wss:':'ws:'; return `${proto}//${u.host}/ais/ws`; }catch{return 'ws://127.0.0.1:7843/ais/ws';} })();
+const AIS_HEALTH_LOCAL = (()=>{ try{return `${window.location.origin}/ais/health`;}catch{return 'http://127.0.0.1:7843/ais/health';} })();
+const AIR_HTTP_PUBLIC = 'https://opensky-network.org/api/states/all';
+const AIR_HTTP_LOCAL = (()=>{ try{return `${window.location.origin}/air/flights`; }catch{return 'http://127.0.0.1:7843/air/flights';} })();
+const AIR_HEALTH_LOCAL = (()=>{ try{return `${window.location.origin}/air/health`; }catch{return 'http://127.0.0.1:7843/air/health';} })();
+async function pingLocalAisRelay(){
+  const r=await fetch(AIS_HEALTH_LOCAL,{cache:'no-store'});
+  if(!r.ok) throw new Error(`relay health ${r.status}`);
+  return await r.json();
+}
 
 // ── MapLibre v5 canvas snapshot ───────────────────────────────────────────
 // MapLibre v5 uses WebGL2 and clears/swaps the drawing buffer at the end of
@@ -4113,6 +5119,23 @@ const SERVER_HTTP = 'http://127.0.0.1:7843';
 
 function captureMapCanvas(map){
   return new Promise((resolve, reject)=>{
+    const stateNow = mapSt.get ? mapSt.get() : null;
+    if(stateNow?.google3dEnabled){
+      try{
+        const viewer=(window.__mdGoogle3DViewer&&window.__mdGoogle3DViewer())||null;
+        const glCanvas=(viewer&&viewer.canvas) || document.querySelector('.cesium-widget canvas') || document.querySelector('#cesiumContainer canvas') || document.querySelector('canvas.cesium-widget');
+        if(viewer){ try{ viewer.resize(); viewer.render(); viewer.scene&&viewer.scene.requestRender&&viewer.scene.requestRender(); }catch(_e){} }
+        if(glCanvas && glCanvas.width && glCanvas.height){
+          const tmp=document.createElement('canvas');
+          tmp.width=glCanvas.width; tmp.height=glCanvas.height;
+          const ctx2d=tmp.getContext('2d',{alpha:false});
+          ctx2d.fillStyle='#000'; ctx2d.fillRect(0,0,tmp.width,tmp.height);
+          ctx2d.drawImage(glCanvas,0,0);
+          resolve(tmp);
+          return;
+        }
+      }catch(e){ console.warn('capture google3d canvas failed', e); }
+    }
     const timeout = setTimeout(()=>reject(new Error('captureMapCanvas timeout')), 8000);
 
     // We need the map to actually fire a render event.
@@ -4125,25 +5148,24 @@ function captureMapCanvas(map){
       const h = glCanvas.height;
       if(!w || !h){ resolve(null); return; }
 
-      // Prefer the Stage Background when it is visible. Globe atmosphere mutates
-      // the container CSS background to the space color, which would otherwise
-      // overwrite the user-selected stage background during export.
-      const container = map.getContainer ? map.getContainer() : null;
-      const stateNow = mapSt.get ? mapSt.get() : null;
-      let bgColor = (container && container.style.background) || '#000';
-      try{
-        const stageOpacity = (globalThis.getResolvedStageBgOpacity || getResolvedStageBgOpacity)(stateNow);
-        if(stateNow?.stageBgVisible!==false && stageOpacity > 0.001){
-          bgColor = getStageBackgroundCss(stateNow);
-        }
-      }catch{}
-
-      // Blit to an intermediate 2D canvas right now, synchronously
+      // Blit synchronously before any await or rAF.
+      // Use drawStageBackgroundForExport so gradient mode is handled correctly —
+      // assigning a CSS gradient string to fillStyle silently becomes black.
+      const stateSnap=mapSt.get?mapSt.get():null;
       const tmp = document.createElement('canvas');
       tmp.width = w; tmp.height = h;
       const ctx2d = tmp.getContext('2d');
-      ctx2d.fillStyle = bgColor;
-      ctx2d.fillRect(0, 0, w, h);
+      try{
+        const sOp=(globalThis.getResolvedStageBgOpacity||getResolvedStageBgOpacity)(stateSnap);
+        if(stateSnap?.stageBgVisible!==false && sOp>0.001){
+          drawStageBackgroundForExport(ctx2d,w,h,stateSnap);
+        }else{
+          const ctn=map.getContainer?map.getContainer():null;
+          const css=(ctn&&ctn.style.background)||'#000';
+          ctx2d.fillStyle=(css.startsWith('linear-gradient')||css.startsWith('radial-gradient'))?'#000':css;
+          ctx2d.fillRect(0,0,w,h);
+        }
+      }catch{ctx2d.fillStyle='#000';ctx2d.fillRect(0,0,w,h);}
       ctx2d.drawImage(glCanvas, 0, 0);  // synchronous — same JS task as render
 
       resolve(tmp);
@@ -4201,7 +5223,6 @@ function drawStageBackgroundForExport(octx,dstW,dstH,state=mapSt.get()){
     const stageOpacity=clampStageAlpha(getOp(state),1);
     if(stageOpacity<=0.001 || state?.stageBgVisible===false) return;
     octx.save();
-    octx.globalCompositeOperation='source-over';
     if((state?.stageBgMode||'solid')==='gradient'){
       const g=makeStageFillStyle(octx,dstW,dstH,state);
       if(g && typeof g.addColorStop==='function'){
@@ -4234,7 +5255,7 @@ function getCoverCropTransform(srcW,srcH,dstW,dstH){
 
 function getStageMaskScreenRingsForExport(map,dstW,dstH,state=mapSt.get()){
   try{
-    if(!map || !state?.stageLookEnabled || !state?.maskEnabled) return [];
+    if(!map || !state?.maskEnabled) return []; // export: check maskEnabled only, not stageLookEnabled
     const layerState=layerSt.get();
     const srcLayer=findMaskSourceLayerById(state.maskSourceLayerId, layerState);
     if(!srcLayer?.geojson) return [];
@@ -4320,7 +5341,8 @@ function drawVisibleStageBackgroundForExport(octx,dstW,dstH,maskCanvas,state=map
 function drawStageMaskedMapForExport(octx,mapSnap,dstW,dstH,map=globalMapRef.current,state=mapSt.get()){
   try{
     if(!mapSnap){ return false; }
-    if(!state?.stageLookEnabled || !state?.maskEnabled || !map){ drawCoverCrop(octx,mapSnap,dstW,dstH); return true; }
+    // Apply mask whenever maskEnabled + maskSourceLayerId are set (regardless of stageLookEnabled live toggle)
+    if(!state?.maskEnabled || !state?.maskSourceLayerId || !map){ drawCoverCrop(octx,mapSnap,dstW,dstH); return true; }
     const maskCanvas = buildStageMaskCanvasForExport(dstW,dstH,map,state);
     if(!maskCanvas){ drawCoverCrop(octx,mapSnap,dstW,dstH); return true; }
     const temp=document.createElement('canvas');
@@ -4339,7 +5361,7 @@ function drawStageMaskedMapForExport(octx,mapSnap,dstW,dstH,map=globalMapRef.cur
 }
 function drawStageOverlayForExport(octx,dstW,dstH,map=globalMapRef.current,state=mapSt.get()){
   try{
-    if(!state?.stageLookEnabled || !state?.maskEnabled || !map) return;
+    if(!state?.maskEnabled || !map) return;
     const layerState=layerSt.get();
     const srcLayer=findMaskSourceLayerById(state.maskSourceLayerId, layerState);
     if(!srcLayer?.geojson) return;
@@ -4411,37 +5433,54 @@ function getLiveStageOverlayCanvas(map=globalMapRef.current){
 async function compositeFrame(map, offscreen, octx, dstW, dstH){
   const state=mapSt.get();
   const mapSnap = await captureMapCanvas(map);
-  octx.clearRect(0, 0, dstW, dstH);
+  octx.clearRect(0,0,dstW,dstH);
 
-  const stageBgOn = getResolvedStageBgOpacity(state) > 0.001;
-  const maskCanvas = (state.stageLookEnabled && state.maskEnabled) ? buildStageMaskCanvasForExport(dstW,dstH,map,state) : null;
-  if(stageBgOn) drawStageBackgroundForExport(octx,dstW,dstH,state);
-  if(state.stageLookEnabled && state.maskEnabled){
+  const stageBgOn=getResolvedStageBgOpacity(state)>0.001 && state?.stageBgVisible!==false;
+  const maskActive=state.maskEnabled && !!state.maskSourceLayerId; // export uses mask whenever maskEnabled+source set, regardless of stageLookEnabled
+
+  if(maskActive){
+    // Build mask once: white = inside mask region
+    const maskCanvas=buildStageMaskCanvasForExport(dstW,dstH,map,state);
+
+    // Step 1: stage background fills the entire frame as base
+    if(stageBgOn) drawStageBackgroundForExport(octx,dstW,dstH,state);
+
+    // Step 2: map rendered ONLY inside the mask
     if(mapSnap){
-      const drewMasked = drawStageMaskedMapForExport(octx,mapSnap,dstW,dstH,map,state);
-      if(!drewMasked){
-        drawCoverCrop(octx, mapSnap, dstW, dstH);
+      const t1=document.createElement('canvas'); t1.width=dstW; t1.height=dstH;
+      const c1=t1.getContext('2d');
+      if(c1){
+        drawCoverCrop(c1,mapSnap,dstW,dstH);
+        if(maskCanvas){
+          c1.globalCompositeOperation=state.maskInvert?'destination-out':'destination-in';
+          c1.drawImage(maskCanvas,0,0,dstW,dstH);
+          c1.globalCompositeOperation='source-over';
+        }
+        octx.drawImage(t1,0,0);
       }
     }
-    let drewLiveStageOverlay=false;
-    if(stageBgOn){
-      try{ forceStageOverlaySyncForExport(map,state); }catch{}
-      try{ drewLiveStageOverlay = drawLiveStageOverlayCanvasForExport(octx,dstW,dstH,map)===true; }catch{}
-      if(!drewLiveStageOverlay){
-        drawVisibleStageBackgroundForExport(octx,dstW,dstH,maskCanvas,state);
-      }
-    }
-    drawStageMaskOutlineForExport(octx, maskCanvas);
-  } else {
-    if(mapSnap) drawCoverCrop(octx, mapSnap, dstW, dstH);
-  }
-  if(stageBgOn){
-    octx.save();
-    octx.globalCompositeOperation='destination-over';
-    drawStageBackgroundForExport(octx,dstW,dstH,state);
-    octx.restore();
-  }
 
+    // Step 3: stage background painted ONLY outside the mask (covers base bg there)
+    if(stageBgOn && maskCanvas){
+      const t2=document.createElement('canvas'); t2.width=dstW; t2.height=dstH;
+      const c2=t2.getContext('2d');
+      if(c2){
+        drawStageBackgroundForExport(c2,dstW,dstH,state);
+        c2.globalCompositeOperation=state.maskInvert?'destination-in':'destination-out';
+        c2.drawImage(maskCanvas,0,0,dstW,dstH);
+        c2.globalCompositeOperation='source-over';
+        octx.drawImage(t2,0,0);
+      }
+    }
+
+    // Step 4: overlay canvas and mask outline
+    try{forceStageOverlaySyncForExport(map,state);}catch{}
+    try{drawLiveStageOverlayCanvasForExport(octx,dstW,dstH,map);}catch{}
+    if(maskCanvas) drawStageMaskOutlineForExport(octx,maskCanvas);
+  } else {
+    if(stageBgOn) drawStageBackgroundForExport(octx,dstW,dstH,state);
+    if(mapSnap) drawCoverCrop(octx,mapSnap,dstW,dstH);
+  }
   const inner = document.getElementById('map-viewport-inner');
   const svgEl = inner
     ? Array.from(inner.querySelectorAll('svg')).find(
@@ -4659,7 +5698,17 @@ function ExportPanel(){
     // ── JSON ──
     if(fmt==='json'){
       setBusy(true);
-      const iov=imgOverlaySt.get().list.map(o=>({...o}));const data={project:projSt.get().active,map:mapSt.get(),layers:layerSt.get(),labels:labelSt.get(),markers:markerSt.get(),timeline:tlSt.get(),sceneKfs:sceneKfStore,imageOverlays:iov,exportedAt:new Date().toISOString()};
+      const iov=imgOverlaySt.get().list.map(o=>({...o}));
+      const project=projSt.get().active;
+      const activeScene=project?.scenes?.[projSt.get().activeSceneIdx]||null;
+      const allSceneKfs={...sceneKfStore};
+      if(activeScene){ allSceneKfs[activeScene.id]={tracks:JSON.parse(JSON.stringify(tlSt.get().tracks||[])),durMs:tlSt.get().durMs}; }
+      const scenes=(project?.scenes||[]).map((sc,idx)=>({
+        ...sc,
+        timeline:(allSceneKfs[sc.id] ? JSON.parse(JSON.stringify(allSceneKfs[sc.id])) : {tracks:[],durMs:sc.dur||0}),
+        isActive:idx===projSt.get().activeSceneIdx
+      }));
+      const data={project:project?{...project,scenes}:project,map:mapSt.get(),layers:layerSt.get(),labels:labelSt.get(),markers:markerSt.get(),timeline:tlSt.get(),sceneKfs:allSceneKfs,imageOverlays:iov,exportedAt:new Date().toISOString()};
       const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
       const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='mapdirector-project.json';a.click();URL.revokeObjectURL(url);
       setBusy(false);setDone(true);setTimeout(()=>setDone(false),3000);return;
@@ -4833,6 +5882,13 @@ function Timeline(){
   const mapState=useStore(mapSt);
   const{tracks,playMs,durMs,playing,selKf}=useStore(tlSt);const scrollRef=useRef(null);const rafRef=useRef(null);const lastTRef=useRef(null);const dragKfRef=useRef(null);const dragPhRef=useRef(false);
   const[editingDur,setEditingDur]=useState(false);const[durInput,setDurInput]=useState('');const durInputRef=useRef(null);
+  // Camera subtrack collapse: Set of parentCameraIds that are collapsed.
+  // Both the camera row and its subtracks share the same parentCameraId value,
+  // so we key the Set on parentCameraId (NOT tr.id) for consistent lookup.
+  const[collapsedCams,setCollapsedCams]=useState(()=>new Set());
+  const toggleCamCollapse=React.useCallback((parentCamId)=>{
+    setCollapsedCams(prev=>{const n=new Set(prev);if(n.has(parentCamId))n.delete(parentCamId);else n.add(parentCamId);return n;});
+  },[]);
   useEffect(()=>{if(!playing){if(rafRef.current)cancelAnimationFrame(rafRef.current);return;}lastTRef.current=performance.now();const tick=()=>{const now=performance.now();const dt=Math.min(now-lastTRef.current,100); // clamp dt to avoid huge jumps after tab switch
     lastTRef.current=now;tlSt.set(s=>{const next=s.playMs+dt;if(next>=s.durMs){setTimeout(()=>tlSt.set({playing:false,playMs:0}),0);return{playMs:s.durMs};}const cam=interpCam(s.tracks,next);if(cam&&globalMapRef.directCam)globalMapRef.directCam(cam);const op=interpOpacity(s.tracks,next);if(op)globalOpacityRef.current=op;const lk=interpLayerKf(s.tracks,next);globalLayerKfRef.current=lk;return{playMs:next};});rafRef.current=requestAnimationFrame(tick);};rafRef.current=requestAnimationFrame(tick);return()=>{if(rafRef.current)cancelAnimationFrame(rafRef.current);};},[playing]);
   useEffect(()=>{const onMove=e=>{if(dragPhRef.current){const el=scrollRef.current;if(!el)return;const rulerEl=document.getElementById('ruler-time-area');if(!rulerEl)return;const rect=rulerEl.getBoundingClientRect();const x=(e.clientX-rect.left)+el.scrollLeft;let ms=xToMs(x,durMs);const allKfMs=tlSt.get().tracks.flatMap(tr=>tr.kfs.map(k=>k.ms));for(const kms of allKfMs){if(Math.abs(kms-ms)<150){ms=kms;break;}}tlSt.set({playMs:ms});const cam=interpCam(tlSt.get().tracks,ms);if(cam)mapSt.set({cam:{lng:cam.lng,lat:cam.lat,zoom:cam.zoom,bearing:cam.bearing,pitch:cam.pitch}});const op=interpOpacity(tlSt.get().tracks,ms);if(op)globalOpacityRef.current=op;const lk=interpLayerKf(tlSt.get().tracks,ms);globalLayerKfRef.current=lk;}if(dragKfRef.current){const{trackId,kfId,startMs,startClientX}=dragKfRef.current;const dxMs=(e.clientX-startClientX)/(PPS/1000);const newMs=clamp(startMs+dxMs,0,durMs);tlSt.set(s=>({tracks:s.tracks.map(tr=>tr.id!==trackId?tr:{...tr,kfs:tr.kfs.map(kf=>kf.id!==kfId?kf:{...kf,ms:newMs}).sort((a,b)=>a.ms-b.ms)})}));} if(dragBlockRef.current){const d=dragBlockRef.current;const dxMs=(e.clientX-d.startClientX)/(PPS/1000);const minDur=120; if(d.mode==='move'){const span=d.end-d.start; let start=clamp(d.start+dxMs,0,Math.max(0,durMs-span)); setItemTrackWindow(d.trackId,start,start+span);} else if(d.mode==='start'){let start=clamp(d.start+dxMs,0,Math.max(0,d.end-minDur)); setItemTrackWindow(d.trackId,start,d.end);} else if(d.mode==='end'){let end=clamp(d.end+dxMs,d.start+minDur,durMs); setItemTrackWindow(d.trackId,d.start,end);} }};const onUp=()=>{dragPhRef.current=false;dragKfRef.current=null;dragBlockRef.current=null;};window.addEventListener('mousemove',onMove);window.addEventListener('mouseup',onUp);return()=>{window.removeEventListener('mousemove',onMove);window.removeEventListener('mouseup',onUp);};},[durMs]);
@@ -4963,11 +6019,23 @@ function Timeline(){
           </div>
           <div style={{width:ADD_W,flexShrink:0,borderLeft:'1px solid var(--border)'}}/>
         </div>
-        {tracks.map((tr,ti)=>(<div key={tr.id} style={{height:TRACK_H,display:'flex',borderBottom:'1px solid var(--border)'}}>
-          <div style={{width:LABEL_W,flexShrink:0,display:'flex',alignItems:'center',padding:'0 4px 0 8px',gap:4,borderRight:'1px solid var(--border)',background:ti%2===0?'var(--bg-panel)':'var(--bg-base)'}}>
+        {tracks.map((tr,ti)=>{
+          const isSub=!!getCameraSubtrackDef(tr.type);
+          const isCamParent=tr.type==='camera';
+          const parentCamId=tr.parentCameraId;
+          // Hide subtrack rows when their parent camera is collapsed
+          if(isSub && parentCamId && collapsedCams.has(parentCamId)) return null;
+          const collapsed=isCamParent && collapsedCams.has(tr.parentCameraId);
+          const nCams=tracks.filter(t=>t.type==='camera').length;
+          return(<div key={tr.id} style={{height:TRACK_H,display:'flex',borderBottom:'1px solid var(--border)'}}>
+          <div
+            style={{width:LABEL_W,flexShrink:0,display:'flex',alignItems:'center',padding:'0 4px 0 8px',gap:4,borderRight:'1px solid var(--border)',background:ti%2===0?'var(--bg-panel)':'var(--bg-base)',cursor:isCamParent?'pointer':'default'}}
+            onDoubleClick={isCamParent?e=>{e.stopPropagation();toggleCamCollapse(tr.parentCameraId);}:undefined}
+            title={isCamParent?'Double-click to collapse/expand Zoom·Bearing·Pitch':undefined}>
+            {isCamParent&&<span style={{fontSize:8,color:'var(--txt3)',flexShrink:0,marginRight:2,userSelect:'none'}}>{collapsed?'▶':'▼'}</span>}
             <div style={{width:8,height:8,borderRadius:2,background:tr.color,flexShrink:0}}/>
-            <span style={{fontSize:9,fontFamily:'var(--fm)',color:getCameraSubtrackDef(tr.type)?'var(--txt3)':'var(--txt2)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',flex:1,paddingLeft:getCameraSubtrackDef(tr.type)?10:0}} title={tr.layerId?`Layer: ${tr.title}`:tr.title}>{tr.title}</span>
-            {(tr.type!=='camera'||tracks.filter(t=>t.type==='camera').length>1)&&<button onClick={e=>{e.stopPropagation();delTrack(tr.id);}} style={{background:'none',border:'none',cursor:'pointer',color:'var(--red)',fontSize:9,padding:'0 1px',lineHeight:1,opacity:0.6,flexShrink:0}} title="Delete track" onMouseEnter={e=>e.currentTarget.style.opacity='1'} onMouseLeave={e=>e.currentTarget.style.opacity='0.6'}>✕</button>}
+            <span style={{fontSize:9,fontFamily:'var(--fm)',color:isSub?'var(--txt3)':'var(--txt2)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',flex:1,paddingLeft:isSub?10:0}} title={tr.layerId?`Layer: ${tr.title}`:tr.title}>{tr.title}</span>
+            {(tr.type!=='camera'||nCams>1)&&<button onClick={e=>{e.stopPropagation();delTrack(tr.id);}} style={{background:'none',border:'none',cursor:'pointer',color:'var(--red)',fontSize:9,padding:'0 1px',lineHeight:1,opacity:0.6,flexShrink:0}} title="Delete track" onMouseEnter={e=>e.currentTarget.style.opacity='1'} onMouseLeave={e=>e.currentTarget.style.opacity='0.6'}>✕</button>}
           </div>
           <div style={{flex:1,position:'relative',cursor:'pointer',overflow:'hidden',background:ti%2===0?'rgba(10,10,20,.5)':'rgba(5,5,12,.6)'}} onClick={scrubAtLane}>
             {ticks.map(ms=>(<div key={ms} style={{position:'absolute',left:msToX(ms),top:0,bottom:0,width:1,background:'var(--border)',pointerEvents:'none'}}/>))}
@@ -4976,7 +6044,7 @@ function Timeline(){
             {tr.kfs.map(kf=>{const isSel=selKf?.kfId===kf.id;return(<div key={kf.id} className="kfd" style={{position:'absolute',left:msToX(kf.ms)-7,top:'50%',transform:'translateY(-50%) rotate(45deg)',width:14,height:14,background:isSel?'#fff':tr.color,border:`2px solid ${isSel?'var(--accent)':'var(--bg-base)'}`,zIndex:2,boxShadow:isSel?`0 0 0 2px var(--accent),0 0 10px rgba(232,255,60,.5)`:undefined}} title={`${fmtMs(kf.ms)} · ${ENAMES[kf.easing]||kf.easing}`} onMouseDown={e=>{e.stopPropagation();tlSt.set({selKf:{trackId:tr.id,kfId:kf.id}});dragKfRef.current={trackId:tr.id,kfId:kf.id,startMs:kf.ms,startClientX:e.clientX};}} onDoubleClick={e=>{e.stopPropagation();delKf(tr.id,kf.id);}}/>);})}
           </div>
           <div style={{width:ADD_W,flexShrink:0,borderLeft:'1px solid var(--border)',display:'flex',alignItems:'center',justifyContent:'center',background:'var(--bg-panel)'}}><button onClick={()=>addKf(tr.id)} title="Capture KF" style={{background:'none',border:'none',cursor:'pointer',color:'var(--txt3)',fontSize:17,padding:0,lineHeight:1}} onMouseEnter={e=>e.currentTarget.style.color='var(--accent)'} onMouseLeave={e=>e.currentTarget.style.color='var(--txt3)'}>◇</button></div>
-        </div>))}
+        </div>);})}
         <div style={{position:'absolute',left:phX-1,top:0,bottom:0,width:2,background:'var(--accent)',opacity:.65,pointerEvents:'none',zIndex:6}}><div style={{position:'absolute',top:RULER_H-6,left:-4,width:10,height:10,background:'var(--accent)',transform:'rotate(45deg)'}}/></div>
       </div>
     </div>
@@ -5347,7 +6415,7 @@ function EditorShell(){
 // APP ROOT
 // ═══════════════════════════════════════════════════════════════
 function App(){const view=useStore(appSt,s=>s.view);return(<div style={{width:'100vw',height:'100vh',overflow:'hidden'}}>{view==='dashboard'?<Dashboard/>:<EditorShell/>}</div>);}
-ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+(window.ReactDOM || ReactDOM).createRoot(document.getElementById('root')).render(<App/>);
 </script>
 </body>
 </html>
