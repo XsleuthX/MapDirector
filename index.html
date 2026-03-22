@@ -767,8 +767,6 @@ function normalizeLiveFlightsSnapshot(data){
   const states=data?.states||[];
   return {type:'FeatureCollection',features:states.map((s,i)=>decodeOpenSkyState(s,i)).filter(Boolean)};
 }
-const __airFetchState = { lastGood:{type:'FeatureCollection',features:[]}, remoteCooldownUntil:0, warnAt:0, localCooldownUntil:0, authFailedUntil:0 };
-const getAirEmptyFC=()=>({type:'FeatureCollection',features:[]});
 function normalizeFlightBounds(bounds){
   if(!bounds) return null;
   const clamp=(v,min,max)=>Math.max(min, Math.min(max, Number(v)));
@@ -784,49 +782,18 @@ function normalizeFlightBounds(bounds){
   if(latSpan > 55 || span > 80) return null;
   return { south, west, north, east, span, latSpan };
 }
-async function fetchOpenSkyPublic(bounds){
-  const url=new URL(AIR_HTTP_PUBLIC);
-  url.searchParams.set('lamin', String(bounds.south));
-  url.searchParams.set('lomin', String(bounds.west));
-  url.searchParams.set('lamax', String(bounds.north));
-  url.searchParams.set('lomax', String(bounds.east));
-  url.searchParams.set('extended','1');
-  const r=await fetch(url.toString(), {cache:'no-store', mode:'cors'});
-  if(!r.ok) throw new Error(`OpenSky public ${r.status}`);
-  return normalizeLiveFlightsSnapshot(await r.json());
-}
-async function fetchOpenSkyRelay(bounds){
-  return fetchOpenSkyPublic(bounds);
-}
 async function fetchFlightsLive(bounds){
   const safeBounds=normalizeFlightBounds(bounds);
-  if(!safeBounds) return __airFetchState.lastGood || getAirEmptyFC();
-  const now=Date.now();
-  const lastGood=()=>__airFetchState.lastGood || getAirEmptyFC();
-  if(now < __airFetchState.remoteCooldownUntil || now < __airFetchState.authFailedUntil){
-    return lastGood();
+  const url=new URL(AIR_HTTP_PUBLIC);
+  if(safeBounds){
+    url.searchParams.set('lamin', String(safeBounds.south));
+    url.searchParams.set('lomin', String(safeBounds.west));
+    url.searchParams.set('lamax', String(safeBounds.north));
+    url.searchParams.set('lomax', String(safeBounds.east));
   }
-  try{
-    const fc=await fetchOpenSkyPublic(safeBounds);
-    if(fc?.features?.length){
-      __airFetchState.lastGood=fc;
-      return fc;
-    }
-  }catch(err){
-    const msg=String(err && err.message || err || '');
-    if(/\b401\b/.test(msg)){
-      __airFetchState.authFailedUntil=Date.now()+30*60*1000;
-    }else if(/\b(403|429|5\d\d)\b/.test(msg)){
-      __airFetchState.remoteCooldownUntil=Date.now()+5*60*1000;
-    }else{
-      __airFetchState.remoteCooldownUntil=Date.now()+2*60*1000;
-    }
-    if(Date.now() > __airFetchState.warnAt){
-      console.warn(`OpenSky public path unavailable; reusing cached flight snapshot. ${msg}`);
-      __airFetchState.warnAt=Date.now()+15000;
-    }
-  }
-  return lastGood();
+  const r=await fetch(url.toString(), {cache:'no-store'});
+  if(!r.ok) throw new Error(`OpenSky request failed (${r.status})`);
+  return normalizeLiveFlightsSnapshot(await r.json());
 }
 
 const BUILTIN_DATA_CENTER_REFERENCE=[
