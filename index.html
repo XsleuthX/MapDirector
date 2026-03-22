@@ -796,60 +796,34 @@ async function fetchOpenSkyPublic(bounds){
   return normalizeLiveFlightsSnapshot(await r.json());
 }
 async function fetchOpenSkyRelay(bounds){
-  const url=new URL(AIR_HTTP_LOCAL(), window.location.href);
-  url.searchParams.set('lamin', String(bounds.south));
-  url.searchParams.set('lomin', String(bounds.west));
-  url.searchParams.set('lamax', String(bounds.north));
-  url.searchParams.set('lomax', String(bounds.east));
-  url.searchParams.set('extended','1');
-  const r=await fetch(url.toString(), {cache:'no-store'});
-  if(!r.ok) throw new Error(`OpenSky relay ${r.status}`);
-  return normalizeLiveFlightsSnapshot(await r.json());
+  return fetchOpenSkyPublic(bounds);
 }
 async function fetchFlightsLive(bounds){
   const safeBounds=normalizeFlightBounds(bounds);
   if(!safeBounds) return __airFetchState.lastGood || getAirEmptyFC();
   const now=Date.now();
   const lastGood=()=>__airFetchState.lastGood || getAirEmptyFC();
-
-  if(now < __airFetchState.localCooldownUntil || now < __airFetchState.authFailedUntil){
+  if(now < __airFetchState.remoteCooldownUntil || now < __airFetchState.authFailedUntil){
     return lastGood();
   }
   try{
-    const fc=await fetchOpenSkyRelay(safeBounds);
+    const fc=await fetchOpenSkyPublic(safeBounds);
     if(fc?.features?.length){
       __airFetchState.lastGood=fc;
       return fc;
     }
   }catch(err){
     const msg=String(err && err.message || err || '');
-    if(/401\b/.test(msg)){
+    if(/\b401\b/.test(msg)){
       __airFetchState.authFailedUntil=Date.now()+30*60*1000;
-    }else if(/\b(429|502|503|504)\b/.test(msg)){
-      __airFetchState.localCooldownUntil=Date.now()+5*60*1000;
+    }else if(/\b(403|429|5\d\d)\b/.test(msg)){
+      __airFetchState.remoteCooldownUntil=Date.now()+5*60*1000;
     }else{
-      __airFetchState.localCooldownUntil=Date.now()+2*60*1000;
+      __airFetchState.remoteCooldownUntil=Date.now()+2*60*1000;
     }
     if(Date.now() > __airFetchState.warnAt){
-      console.warn(`OpenSky relay unavailable; falling back to public/ADSB path. ${msg}`);
+      console.warn(`OpenSky public path unavailable; reusing cached flight snapshot. ${msg}`);
       __airFetchState.warnAt=Date.now()+15000;
-    }
-  }
-
-  if(now >= __airFetchState.remoteCooldownUntil){
-    try{
-      const fc=await fetchOpenSkyPublic(safeBounds);
-      if(fc?.features?.length){
-        __airFetchState.lastGood=fc;
-        return fc;
-      }
-    }catch(err){
-      const msg=String(err && err.message || err || '');
-      if(/\b(401|403|429|5\d\d)\b/.test(msg)) __airFetchState.remoteCooldownUntil=Date.now()+5*60*1000;
-      if(Date.now() > __airFetchState.warnAt){
-        console.warn(`OpenSky public path unavailable; reusing cached flight snapshot. ${msg}`);
-        __airFetchState.warnAt=Date.now()+15000;
-      }
     }
   }
   return lastGood();
@@ -4507,7 +4481,7 @@ function OverlaysPanel(){
           <input value={live.backendBase||''} onChange={e=>liveTrafficSt.set({backendBase:e.target.value})} placeholder="Backend base URL · http://127.0.0.1:7843 or https://your-tunnel.example.com" style={{width:'100%',padding:'6px 8px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--txt)',fontSize:10,fontFamily:'var(--fm)'}} />
           <Btn sz="xs" v="ghost" onClick={()=>liveTrafficSt.set({backendBase:'http://127.0.0.1:7843'})}>Reset</Btn>
         </div>
-        <div style={{fontSize:9,color:'var(--txt3)',lineHeight:'13px'}}>Used for <span style={{fontFamily:'var(--fm)'}}>/air/flights</span>, <span style={{fontFamily:'var(--fm)'}}>/air/health</span>, <span style={{fontFamily:'var(--fm)'}}>/ais/ships</span>, <span style={{fontFamily:'var(--fm)'}}>/ais/ws</span>, <span style={{fontFamily:'var(--fm)'}}>/ais/health</span>, <span style={{fontFamily:'var(--fm)'}}>/ws</span>, and MP4 export when you host the app on GitHub Pages.</div>
+        <div style={{fontSize:9,color:'var(--txt3)',lineHeight:'13px'}}>Used for <span style={{fontFamily:'var(--fm)'}}>/ais/ships</span>, <span style={{fontFamily:'var(--fm)'}}>/ais/ws</span>, <span style={{fontFamily:'var(--fm)'}}>/ais/health</span>, <span style={{fontFamily:'var(--fm)'}}>/ws</span>, and MP4 export when you host the app on GitHub Pages. OpenSky uses its direct public path again.</div>
         <input value={live.shipsUrl} onChange={e=>liveTrafficSt.set({shipsUrl:e.target.value})} placeholder="Ship feed URL · use Local HTTP / Local WS to fill from backend base" style={{width:'100%',padding:'6px 8px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--txt)',fontSize:10}} />
         <div style={{display:'grid',gridTemplateColumns:'1fr auto',gap:8,alignItems:'center'}}>
           <input value={live.shipsApiKey||''} onChange={e=>liveTrafficSt.set({shipsApiKey:e.target.value})} placeholder="AISSTREAM_API_KEY" style={{width:'100%',padding:'6px 8px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--txt)',fontSize:10,fontFamily:'var(--fm)'}} />
@@ -4524,7 +4498,7 @@ function OverlaysPanel(){
           <label style={{display:'flex',alignItems:'center',gap:6,fontSize:10,color:'var(--txt2)'}}><input type="checkbox" checked={!!live.shipsUseViewport} onChange={e=>liveTrafficSt.set({shipsUseViewport:e.target.checked})}/>Pass current bbox</label>
           <input value={live.shipsPollMs} onChange={e=>liveTrafficSt.set({shipsPollMs:Math.max(5000,parseInt(e.target.value||'15000',10)||15000)})} style={{width:'100%',padding:'4px 6px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--txt)',fontSize:10}} title="poll ms" />
         </div>
-        <div style={{fontSize:9,color:'var(--txt3)',lineHeight:'13px'}}>This build is wired for one configurable backend: <span style={{fontFamily:'var(--fm)'}}>GET /ais/ships</span>, <span style={{fontFamily:'var(--fm)'}}>WS /ais/ws</span>, <span style={{fontFamily:'var(--fm)'}}>GET /ais/health</span>, <span style={{fontFamily:'var(--fm)'}}>GET /air/flights</span>, <span style={{fontFamily:'var(--fm)'}}>GET /air/health</span>, and <span style={{fontFamily:'var(--fm)'}}>WS /ws</span> for MP4 export.</div>
+        <div style={{fontSize:9,color:'var(--txt3)',lineHeight:'13px'}}>This build is wired for one configurable backend: <span style={{fontFamily:'var(--fm)'}}>GET /ais/ships</span>, <span style={{fontFamily:'var(--fm)'}}>WS /ais/ws</span>, <span style={{fontFamily:'var(--fm)'}}>GET /ais/health</span>, and <span style={{fontFamily:'var(--fm)'}}>WS /ws</span> for MP4 export. OpenSky uses its direct public path again.</div>
       </div>
       {cats.map(cat=>(<div key={cat}>
         <div style={{fontSize:9,fontFamily:'var(--fm)',color:'var(--txt3)',marginBottom:5,letterSpacing:'.08em'}}>{cat.toUpperCase()}</div>
@@ -5152,7 +5126,7 @@ const AIS_HTTP_LOCAL = ()=>backendHttpUrl('/ais/ships');
 const AIS_WS_LOCAL = ()=>backendWsUrl('/ais/ws');
 const AIS_HEALTH_LOCAL = ()=>backendHttpUrl('/ais/health');
 const AIR_HTTP_PUBLIC = 'https://opensky-network.org/api/states/all';
-const AIR_HTTP_LOCAL = ()=>backendHttpUrl('/air/flights');
+const AIR_HTTP_LOCAL = ()=>AIR_HTTP_PUBLIC;
 const AIR_HEALTH_LOCAL = ()=>backendHttpUrl('/air/health');
 async function pingLocalAisRelay(){
   const r=await fetch(AIS_HEALTH_LOCAL(),{cache:'no-store'});
