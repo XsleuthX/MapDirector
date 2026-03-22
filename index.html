@@ -767,6 +767,8 @@ function normalizeLiveFlightsSnapshot(data){
   const states=data?.states||[];
   return {type:'FeatureCollection',features:states.map((s,i)=>decodeOpenSkyState(s,i)).filter(Boolean)};
 }
+const __airFetchState = { lastGood:{type:'FeatureCollection',features:[]}, remoteCooldownUntil:0, warnAt:0, localCooldownUntil:0, authFailedUntil:0 };
+const getAirEmptyFC=()=>({type:'FeatureCollection',features:[]});
 function normalizeFlightBounds(bounds){
   if(!bounds) return null;
   const clamp=(v,min,max)=>Math.max(min, Math.min(max, Number(v)));
@@ -782,18 +784,75 @@ function normalizeFlightBounds(bounds){
   if(latSpan > 55 || span > 80) return null;
   return { south, west, north, east, span, latSpan };
 }
+async function fetchOpenSkyPublic(bounds){
+  const url=new URL(AIR_HTTP_PUBLIC);
+  url.searchParams.set('lamin', String(bounds.south));
+  url.searchParams.set('lomin', String(bounds.west));
+  url.searchParams.set('lamax', String(bounds.north));
+  url.searchParams.set('lomax', String(bounds.east));
+  url.searchParams.set('extended','1');
+  const r=await fetch(url.toString(), {cache:'no-store', mode:'cors'});
+  if(!r.ok) throw new Error(`OpenSky public ${r.status}`);
+  return normalizeLiveFlightsSnapshot(await r.json());
+}
+async function fetchOpenSkyRelay(bounds){
+  const url=new URL(AIR_HTTP_LOCAL(), window.location.href);
+  url.searchParams.set('lamin', String(bounds.south));
+  url.searchParams.set('lomin', String(bounds.west));
+  url.searchParams.set('lamax', String(bounds.north));
+  url.searchParams.set('lomax', String(bounds.east));
+  url.searchParams.set('extended','1');
+  const r=await fetch(url.toString(), {cache:'no-store'});
+  if(!r.ok) throw new Error(`OpenSky relay ${r.status}`);
+  return normalizeLiveFlightsSnapshot(await r.json());
+}
 async function fetchFlightsLive(bounds){
   const safeBounds=normalizeFlightBounds(bounds);
-  const url=new URL(AIR_HTTP_PUBLIC);
-  if(safeBounds){
-    url.searchParams.set('lamin', String(safeBounds.south));
-    url.searchParams.set('lomin', String(safeBounds.west));
-    url.searchParams.set('lamax', String(safeBounds.north));
-    url.searchParams.set('lomax', String(safeBounds.east));
+  if(!safeBounds) return __airFetchState.lastGood || getAirEmptyFC();
+  const now=Date.now();
+  const lastGood=()=>__airFetchState.lastGood || getAirEmptyFC();
+
+  if(now < __airFetchState.localCooldownUntil || now < __airFetchState.authFailedUntil){
+    return lastGood();
   }
-  const r=await fetch(url.toString(), {cache:'no-store'});
-  if(!r.ok) throw new Error(`OpenSky request failed (${r.status})`);
-  return normalizeLiveFlightsSnapshot(await r.json());
+  try{
+    const fc=await fetchOpenSkyRelay(safeBounds);
+    if(fc?.features?.length){
+      __airFetchState.lastGood=fc;
+      return fc;
+    }
+  }catch(err){
+    const msg=String(err && err.message || err || '');
+    if(/401\b/.test(msg)){
+      __airFetchState.authFailedUntil=Date.now()+30*60*1000;
+    }else if(/\b(429|502|503|504)\b/.test(msg)){
+      __airFetchState.localCooldownUntil=Date.now()+5*60*1000;
+    }else{
+      __airFetchState.localCooldownUntil=Date.now()+2*60*1000;
+    }
+    if(Date.now() > __airFetchState.warnAt){
+      console.warn(`OpenSky relay unavailable; falling back to public/ADSB path. ${msg}`);
+      __airFetchState.warnAt=Date.now()+15000;
+    }
+  }
+
+  if(now >= __airFetchState.remoteCooldownUntil){
+    try{
+      const fc=await fetchOpenSkyPublic(safeBounds);
+      if(fc?.features?.length){
+        __airFetchState.lastGood=fc;
+        return fc;
+      }
+    }catch(err){
+      const msg=String(err && err.message || err || '');
+      if(/\b(401|403|429|5\d\d)\b/.test(msg)) __airFetchState.remoteCooldownUntil=Date.now()+5*60*1000;
+      if(Date.now() > __airFetchState.warnAt){
+        console.warn(`OpenSky public path unavailable; reusing cached flight snapshot. ${msg}`);
+        __airFetchState.warnAt=Date.now()+15000;
+      }
+    }
+  }
+  return lastGood();
 }
 
 const BUILTIN_DATA_CENTER_REFERENCE=[
@@ -1514,8 +1573,9 @@ const liveTrafficSt=mkStore({
   flightsStatus:'idle',
   flightsCount:0,
   flightsLastAt:'',
+  backendBase:(()=>{ try{return localStorage.getItem('mapdirector_backend_base')||'http://127.0.0.1:7843';}catch{return 'http://127.0.0.1:7843';}})(),
   shipsEnabled:false,
-  shipsUrl:(location.origin ? `${location.origin}/ais/ships` : 'http://127.0.0.1:7843/ais/ships'),
+  shipsUrl:(()=>{ try{ const base=localStorage.getItem('mapdirector_backend_base')||'http://127.0.0.1:7843'; return `${String(base).replace(/\/$/,'')}/ais/ships`; }catch{return 'http://127.0.0.1:7843/ais/ships';} })(),
   shipsApiKey:(()=>{ try{return localStorage.getItem('mapdirector_aisstream_api_key')||'';}catch{return '';}})(),
   shipsPollMs:15000,
   shipsUseViewport:true,
@@ -3724,6 +3784,9 @@ useEffect(()=>{const map=mapRef.current;if(!map||!ready)return;const apply=()=>{
     try{ localStorage.setItem('mapdirector_aisstream_api_key', String(liveTraffic.shipsApiKey||'')); }catch{}
   },[liveTraffic.shipsApiKey]);
   useEffect(()=>{
+    try{ localStorage.setItem('mapdirector_backend_base', String(liveTraffic.backendBase||'http://127.0.0.1:7843')); }catch{}
+  },[liveTraffic.backendBase]);
+  useEffect(()=>{
     const map=mapRef.current;if(!map||!ready)return;
     const live=liveTrafficSt.get();
     let timer=null,cancelled=false;
@@ -4375,8 +4438,8 @@ function OverlaysPanel(){
   const [loadingId,setLoadingId]=useState(null);
   const [err,setErr]=useState('');
   const [relayInfo,setRelayInfo]=useState('');
-  const setLocalHttp=()=>liveTrafficSt.set({shipsUrl:AIS_HTTP_LOCAL});
-  const setLocalWs=()=>liveTrafficSt.set({shipsUrl:AIS_WS_LOCAL});
+  const setLocalHttp=()=>liveTrafficSt.set({shipsUrl:backendHttpUrl('/ais/ships')});
+  const setLocalWs=()=>liveTrafficSt.set({shipsUrl:backendWsUrl('/ais/ws')});
   const checkRelay=async()=>{
     try{
       setRelayInfo('checking…');
@@ -4440,7 +4503,12 @@ function OverlaysPanel(){
             <Btn sz="xs" v={live.shipsEnabled?'solid':'ghost'} onClick={()=>liveTrafficSt.set(s=>({shipsEnabled:!s.shipsEnabled}))}>{live.shipsEnabled?'Stop':'Start'}</Btn>
           </div>
         </div>
-        <input value={live.shipsUrl} onChange={e=>liveTrafficSt.set({shipsUrl:e.target.value})} placeholder="http://127.0.0.1:7843/ais/ships or ws://127.0.0.1:7843/ais/ws" style={{width:'100%',padding:'6px 8px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--txt)',fontSize:10}} />
+        <div style={{display:'grid',gridTemplateColumns:'1fr auto',gap:8,alignItems:'center'}}>
+          <input value={live.backendBase||''} onChange={e=>liveTrafficSt.set({backendBase:e.target.value})} placeholder="Backend base URL · http://127.0.0.1:7843 or https://your-tunnel.example.com" style={{width:'100%',padding:'6px 8px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--txt)',fontSize:10,fontFamily:'var(--fm)'}} />
+          <Btn sz="xs" v="ghost" onClick={()=>liveTrafficSt.set({backendBase:'http://127.0.0.1:7843'})}>Reset</Btn>
+        </div>
+        <div style={{fontSize:9,color:'var(--txt3)',lineHeight:'13px'}}>Used for <span style={{fontFamily:'var(--fm)'}}>/air/flights</span>, <span style={{fontFamily:'var(--fm)'}}>/air/health</span>, <span style={{fontFamily:'var(--fm)'}}>/ais/ships</span>, <span style={{fontFamily:'var(--fm)'}}>/ais/ws</span>, <span style={{fontFamily:'var(--fm)'}}>/ais/health</span>, <span style={{fontFamily:'var(--fm)'}}>/ws</span>, and MP4 export when you host the app on GitHub Pages.</div>
+        <input value={live.shipsUrl} onChange={e=>liveTrafficSt.set({shipsUrl:e.target.value})} placeholder="Ship feed URL · use Local HTTP / Local WS to fill from backend base" style={{width:'100%',padding:'6px 8px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--txt)',fontSize:10}} />
         <div style={{display:'grid',gridTemplateColumns:'1fr auto',gap:8,alignItems:'center'}}>
           <input value={live.shipsApiKey||''} onChange={e=>liveTrafficSt.set({shipsApiKey:e.target.value})} placeholder="AISSTREAM_API_KEY" style={{width:'100%',padding:'6px 8px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--txt)',fontSize:10,fontFamily:'var(--fm)'}} />
           <Btn sz="xs" v="ghost" onClick={()=>liveTrafficSt.set({shipsApiKey:''})}>Clear</Btn>
@@ -4456,7 +4524,7 @@ function OverlaysPanel(){
           <label style={{display:'flex',alignItems:'center',gap:6,fontSize:10,color:'var(--txt2)'}}><input type="checkbox" checked={!!live.shipsUseViewport} onChange={e=>liveTrafficSt.set({shipsUseViewport:e.target.checked})}/>Pass current bbox</label>
           <input value={live.shipsPollMs} onChange={e=>liveTrafficSt.set({shipsPollMs:Math.max(5000,parseInt(e.target.value||'15000',10)||15000)})} style={{width:'100%',padding:'4px 6px',background:'var(--bg)',border:'1px solid var(--border)',borderRadius:4,color:'var(--txt)',fontSize:10}} title="poll ms" />
         </div>
-        <div style={{fontSize:9,color:'var(--txt3)',lineHeight:'13px'}}>This build is wired for one local backend: <span style={{fontFamily:'var(--fm)'}}>GET /ais/ships</span>, <span style={{fontFamily:'var(--fm)'}}>WS /ais/ws</span>, <span style={{fontFamily:'var(--fm)'}}>GET /ais/health</span>, <span style={{fontFamily:'var(--fm)'}}>GET /air/flights</span>, <span style={{fontFamily:'var(--fm)'}}>GET /air/health</span>, and <span style={{fontFamily:'var(--fm)'}}>WS /ws</span> for MP4 export.</div>
+        <div style={{fontSize:9,color:'var(--txt3)',lineHeight:'13px'}}>This build is wired for one configurable backend: <span style={{fontFamily:'var(--fm)'}}>GET /ais/ships</span>, <span style={{fontFamily:'var(--fm)'}}>WS /ais/ws</span>, <span style={{fontFamily:'var(--fm)'}}>GET /ais/health</span>, <span style={{fontFamily:'var(--fm)'}}>GET /air/flights</span>, <span style={{fontFamily:'var(--fm)'}}>GET /air/health</span>, and <span style={{fontFamily:'var(--fm)'}}>WS /ws</span> for MP4 export.</div>
       </div>
       {cats.map(cat=>(<div key={cat}>
         <div style={{fontSize:9,fontFamily:'var(--fm)',color:'var(--txt3)',marginBottom:5,letterSpacing:'.08em'}}>{cat.toUpperCase()}</div>
@@ -5046,16 +5114,48 @@ function SearchPanel({onClose}){
 // ═══════════════════════════════════════════════════════════════
 
 // Wait for MapLibre to finish rendering a frame after a camera change
-const SERVER_WS  = 'ws://127.0.0.1:7843/ws';
-const SERVER_HTTP = 'http://127.0.0.1:7843';
-const AIS_HTTP_LOCAL = (()=>{ try{return `${window.location.origin}/ais/ships`;}catch{return 'http://127.0.0.1:7843/ais/ships';} })();
-const AIS_WS_LOCAL = (()=>{ try{ const u=new URL(window.location.origin); const proto=u.protocol==='https:'?'wss:':'ws:'; return `${proto}//${u.host}/ais/ws`; }catch{return 'ws://127.0.0.1:7843/ais/ws';} })();
-const AIS_HEALTH_LOCAL = (()=>{ try{return `${window.location.origin}/ais/health`;}catch{return 'http://127.0.0.1:7843/ais/health';} })();
+const DEFAULT_BACKEND_BASE='http://127.0.0.1:7843';
+function getBackendBase(){
+  try{
+    const live=(typeof liveTrafficSt!=='undefined' && liveTrafficSt && typeof liveTrafficSt.get==='function')?liveTrafficSt.get():null;
+    const fromStore=String(live?.backendBase||'').trim();
+    if(fromStore) return fromStore.replace(/\/$/,'');
+  }catch{}
+  try{
+    const saved=String(localStorage.getItem('mapdirector_backend_base')||'').trim();
+    if(saved) return saved.replace(/\/$/,'');
+  }catch{}
+  return DEFAULT_BACKEND_BASE;
+}
+function backendHttpUrl(path=''){
+  const base=getBackendBase();
+  const cleanPath=String(path||'').startsWith('/')?String(path||''):`/${String(path||'')}`;
+  return `${base}${cleanPath}`;
+}
+function backendWsUrl(path='/ws'){
+  const base=getBackendBase();
+  try{
+    const u=new URL(base, window.location.href);
+    u.protocol = u.protocol==='https:' ? 'wss:' : 'ws:';
+    u.pathname = String(path||'/ws').startsWith('/') ? String(path||'/ws') : `/${String(path||'/ws')}`;
+    u.search='';
+    u.hash='';
+    return u.toString();
+  }catch{
+    const wsBase=base.replace(/^https:/i,'wss:').replace(/^http:/i,'ws:');
+    return `${wsBase.replace(/\/$/,'')}${String(path||'/ws').startsWith('/') ? String(path||'/ws') : `/${String(path||'/ws')}`}`;
+  }
+}
+const SERVER_WS  = ()=>backendWsUrl('/ws');
+const SERVER_HTTP = ()=>backendHttpUrl('');
+const AIS_HTTP_LOCAL = ()=>backendHttpUrl('/ais/ships');
+const AIS_WS_LOCAL = ()=>backendWsUrl('/ais/ws');
+const AIS_HEALTH_LOCAL = ()=>backendHttpUrl('/ais/health');
 const AIR_HTTP_PUBLIC = 'https://opensky-network.org/api/states/all';
-const AIR_HTTP_LOCAL = (()=>{ try{return `${window.location.origin}/air/flights`; }catch{return 'http://127.0.0.1:7843/air/flights';} })();
-const AIR_HEALTH_LOCAL = (()=>{ try{return `${window.location.origin}/air/health`; }catch{return 'http://127.0.0.1:7843/air/health';} })();
+const AIR_HTTP_LOCAL = ()=>backendHttpUrl('/air/flights');
+const AIR_HEALTH_LOCAL = ()=>backendHttpUrl('/air/health');
 async function pingLocalAisRelay(){
-  const r=await fetch(AIS_HEALTH_LOCAL,{cache:'no-store'});
+  const r=await fetch(AIS_HEALTH_LOCAL(),{cache:'no-store'});
   if(!r.ok) throw new Error(`relay health ${r.status}`);
   return await r.json();
 }
@@ -5471,7 +5571,7 @@ async function compositeFrame(map, offscreen, octx, dstW, dstH){
 function checkServer(){
   return new Promise(resolve=>{
     try{
-      const ws=new WebSocket(SERVER_WS);
+      const ws=new WebSocket(SERVER_WS());
       const t=setTimeout(()=>{ws.close();resolve(false);},1800);
       ws.onopen=()=>{clearTimeout(t);ws.close();resolve(true);};
       ws.onerror=()=>{clearTimeout(t);resolve(false);};
@@ -5500,7 +5600,7 @@ async function renderAndStreamToServer({map,tracks,durMs,fps,width,height,onProg
     const fail=msg=>{if(!done){done=true;try{ws&&ws.close();}catch{}reject(new Error(msg));}};
     const succeed=blob=>{if(!done){done=true;try{ws&&ws.close();}catch{}resolve(blob);}};
 
-    try{ ws=new WebSocket(SERVER_WS); ws.binaryType='arraybuffer'; }
+    try{ ws=new WebSocket(SERVER_WS()); ws.binaryType='arraybuffer'; }
     catch(e){fail('WebSocket open failed: '+e.message);return;}
 
     const mp4Parts=[];
