@@ -13,7 +13,7 @@
 </style>
 <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.7/babel.min.js"></script>
 <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.20.1/dist/maplibre-gl.css">
 <script src="https://unpkg.com/maplibre-gl@5.20.1/dist/maplibre-gl.js"></script>
 <style>
@@ -402,7 +402,7 @@ import { KTX2Loader } from 'three/examples/jsm/loaders/KTX2Loader.js';
 })();
 </script>
 
-<script type="text/babel">
+<script type="text/babel" data-presets="react,env">
 const {useState,useEffect,useRef,useCallback,useReducer,useMemo}=React;
 
 async function resolveCesiumIonAssetEndpoint(token, assetId){
